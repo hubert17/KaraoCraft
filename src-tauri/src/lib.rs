@@ -238,6 +238,7 @@ async fn transcribe_whisper_words(
 
         if engine_name == "whisper" {
             cmd.arg("--model").arg("base");
+            cmd.arg("--fp16").arg("False");
         }
 
         let output = cmd.output();
