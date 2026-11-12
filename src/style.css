@@ -3,41 +3,89 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
+  font-size: 16px;
 }
 
-body {
+html,
+body,
+#app {
+  height: 100%;
   margin: 0;
   padding: 0;
-  background-color: #0c0d12;
-  color: #f1f5f9;
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Hiragino Sans", sans-serif;
-  overflow: hidden;
-  user-select: none;
+  background-color: #ffffff;
+  color: #0f172a;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Hiragino Sans", sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
-/* Custom scrollbars */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: #2b3147;
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #475569;
+/* Musical 5-line staff header background inspired by Croonify */
+.musical-staff-bg {
+  background-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    transparent 18%,
+    #e2e8f0 18%,
+    #e2e8f0 22%,
+    transparent 22%,
+    transparent 37%,
+    #e2e8f0 37%,
+    #e2e8f0 41%,
+    transparent 41%,
+    transparent 56%,
+    #e2e8f0 56%,
+    #e2e8f0 60%,
+    transparent 60%,
+    transparent 75%,
+    #e2e8f0 75%,
+    #e2e8f0 79%,
+    transparent 79%,
+    transparent 94%,
+    #e2e8f0 94%,
+    #e2e8f0 98%,
+    transparent 98%
+  );
 }
 
-/* Draggable window title bar for macOS */
+/* Clean, accessible light scrollbars */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: #f8fafc;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+  border: 2px solid #f8fafc;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Color input swatch normalization */
+input[type="color"].clean-swatch {
+  -webkit-appearance: none;
+  appearance: none;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 3px;
+  background: #ffffff;
+  cursor: pointer;
+}
+input[type="color"].clean-swatch::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+input[type="color"].clean-swatch::-webkit-color-swatch {
+  border: 1px solid rgba(15, 23, 42, 0.15);
+  border-radius: 5px;
+}
+
+/* macOS Overlay Titlebar Drag Helpers */
 .titlebar-drag {
   -webkit-app-region: drag;
 }
 .titlebar-no-drag {
   -webkit-app-region: no-drag;
 }
-
