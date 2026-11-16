@@ -507,7 +507,8 @@ export function alignLyricsWithWhisperWords(
   durationSec: number,
   rmsEnvelope: Float32Array | null,
   rmsHz: number,
-  linesPerFrame = 4
+  linesPerFrame = 4,
+  exactAligned = false
 ): AlignedLyricLine[] {
   const parsedLines = parseRawLyrics(rawLyrics);
   if (parsedLines.length === 0) return [];
@@ -525,6 +526,42 @@ export function alignLyricsWithWhisperWords(
 
   const N = flatTokens.length;
   const M = whisperWords.length;
+
+  // Fast path: 1-to-1 Phonetic Forced Alignment (MMS_FA)
+  if (exactAligned && N === M) {
+    let cursor = 0;
+    const aligned: AlignedLyricLine[] = parsedLines.map((pl, lIdx) => {
+      const count = pl.words.length;
+      const words: WordSegment[] = [];
+      for (let w = 0; w < count; w++) {
+        const ww = whisperWords[cursor + w];
+        const s = Math.max(0, ww.start);
+        const e = Math.max(s + 0.08, ww.end);
+        words.push({
+          id: `word-${lIdx}-${w}`,
+          text: pl.words[w],
+          startSec: Number(s.toFixed(3)),
+          endSec: Number(e.toFixed(3)),
+        });
+      }
+      cursor += count;
+      const lineStart = words[0]?.startSec ?? 0;
+      const lineEnd = words[words.length - 1]?.endSec ?? lineStart + 1;
+
+      return {
+        id: `line-${lIdx}`,
+        text: pl.text,
+        startSec: lineStart,
+        endSec: lineEnd,
+        stanzaBreakBefore: pl.stanzaBreakBefore,
+        frameIndex: 0,
+        words,
+      };
+    });
+
+    assignFramesToLines(aligned, linesPerFrame);
+    return aligned;
+  }
 
   // DP matrix for sequence alignment
   const gapPenalty = -0.35;
@@ -604,6 +641,12 @@ export function alignLyricsWithWhisperWords(
   }
 
   // Interpolate unmatched spans between matched anchors
+  const islands =
+    rmsEnvelope && rmsEnvelope.length > 0
+      ? detectVocalIslands(rmsEnvelope, rmsHz, Math.max(2.0, durationSec || 180))
+      : [];
+  const firstIslandStart = islands[0]?.startSec ?? Math.max(0, (whisperWords[0]?.start ?? 1) - 0.8);
+
   let idx = 0;
   while (idx < N) {
     if (matchedWhisperIdx[idx] >= 0) {
@@ -616,7 +659,10 @@ export function alignLyricsWithWhisperWords(
     }
     const spanEnd = idx - 1;
 
-    const tLeft = spanStart > 0 ? wordEnds[spanStart - 1] : Math.max(0, (whisperWords[0]?.start ?? 1) - 0.8);
+    const tLeft =
+      spanStart > 0
+        ? wordEnds[spanStart - 1]
+        : Math.min(firstIslandStart, Math.max(0, (whisperWords[0]?.start ?? 1) - 0.8));
     const tRight =
       idx < N
         ? Math.max(tLeft + 0.15, wordStarts[idx])

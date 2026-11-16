@@ -6,6 +6,7 @@ import {
   alignLyricsWithWaveform,
   alignLyricsWithWhisperWords,
   assignFramesToLines,
+  parseRawLyrics,
   resyncWordsWithinLines,
   type AlignedLyricLine,
   type WhisperWordInput,
@@ -32,6 +33,7 @@ export interface SystemCapabilities {
 interface WhisperAlignmentResponse {
   available: boolean;
   engine: string | null;
+  exactAligned?: boolean;
   words: WhisperWordInput[];
 }
 
@@ -294,14 +296,20 @@ export const useProjectStore = defineStore('project', () => {
     try {
       let aligned: AlignedLyricLine[] | null = null;
 
+      if (isTauriEnv.value && !systemCaps.value.whisperAvailable) {
+        await detectSystemCapabilities();
+      }
+
       if (isTauriEnv.value && systemCaps.value.whisperAvailable && vocalFile.value) {
-        alignmentMessage.value = `Running local AI word alignment (${systemCaps.value.whisperEngine})...`;
+        alignmentMessage.value = `Running local AI phonetic forced alignment (${systemCaps.value.whisperEngine})...`;
         try {
           const ext = vocalFile.value.name.split('.').pop() || 'mp3';
           const b64 = await fileToBase64(vocalFile.value);
+          const lyricWords = parseRawLyrics(rawLyrics.value).flatMap((l) => l.words);
           const resp = await invoke<WhisperAlignmentResponse>('transcribe_whisper_words', {
             audioBase64: b64,
             audioExt: ext,
+            lyricWords,
           });
           if (resp.available && resp.words.length >= 3) {
             aligned = alignLyricsWithWhisperWords(
@@ -310,7 +318,8 @@ export const useProjectStore = defineStore('project', () => {
               duration.value,
               rmsEnvelope.value,
               rmsHz.value,
-              options.value.linesPerFrame
+              options.value.linesPerFrame,
+              Boolean(resp.exactAligned)
             );
             alignmentSource.value = 'whisper';
           }

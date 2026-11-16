@@ -111,6 +111,28 @@ describe('KaraoCraft Alignment & Subtitle Engine', () => {
     assert.equal(aligned[1].endSec, 5.2);
   });
 
+  it('maps 1-to-1 MMS_FA phonetic forced alignment timestamps directly without string-match loss', () => {
+    const raw = ['Koi mo nidome nara', 'Sukoshi wa jouzu ni'].join(LF);
+    const mmsWords = [
+      { word: 'Koi', start: 15.12, end: 15.58 },
+      { word: 'mo', start: 15.62, end: 15.82 },
+      { word: 'nidome', start: 15.86, end: 17.26 },
+      { word: 'nara', start: 17.3, end: 17.96 },
+      { word: 'Sukoshi', start: 19.08, end: 19.7 },
+      { word: 'wa', start: 19.74, end: 20.16 },
+      { word: 'jouzu', start: 20.2, end: 21.36 },
+      { word: 'ni', start: 21.4, end: 22.04 },
+    ];
+
+    const aligned = alignLyricsWithWhisperWords(raw, mmsWords, 240.5, null, 50, 4, true);
+    assert.equal(aligned.length, 2);
+    assert.equal(aligned[0].startSec, 15.12);
+    assert.equal(aligned[0].endSec, 17.96);
+    assert.equal(aligned[0].words[0].startSec, 15.12);
+    assert.equal(aligned[1].startSec, 19.08);
+    assert.equal(aligned[1].endSec, 22.04);
+  });
+
   it('generates valid ASS karaoke script and renders cleanly through FFmpeg libass', () => {
     assert.equal(hexToAssColor('#004bfa', '00'), '&H00FA4B00');
 
