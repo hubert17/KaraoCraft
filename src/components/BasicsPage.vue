@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue';
 import { useProjectStore } from '../stores/projectStore';
-import { RefreshCw, Eraser, Upload } from '@lucide/vue';
+import { RefreshCw, Eraser, Upload, CaseSensitive, CaseUpper } from '@lucide/vue';
 
 const project = useProjectStore();
 const vocalInputRef = ref<HTMLInputElement | null>(null);
@@ -111,14 +111,58 @@ async function onVocalChange(e: Event) {
           <label for="basics-lyrics" class="text-xl font-bold text-slate-800">
             Lyrics
           </label>
-          <button
-            type="button"
-            @click="project.stripSectionHeaders()"
-            class="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 px-3 py-1.5 rounded-lg transition-colors"
-          >
-            <Eraser class="w-4 h-4" />
-            <span>Strip [Chorus/Verse] Tags</span>
-          </button>
+          <div class="flex items-center gap-1.5">
+            <!-- Sentence case icon button with hover popover -->
+            <div class="relative group">
+              <button
+                type="button"
+                @click="project.toSentenceCaseLyrics()"
+                aria-label="Sentence case"
+                class="inline-flex items-center justify-center text-slate-600 hover:text-brand-purple bg-slate-100 hover:bg-purple-50 border border-slate-200/80 hover:border-purple-200 p-1.5 rounded-lg transition-colors"
+              >
+                <CaseSensitive class="w-4 h-4" />
+              </button>
+              <div
+                class="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 px-2.5 py-1 rounded-md bg-slate-900 text-white text-xs font-medium whitespace-nowrap shadow-md z-20"
+              >
+                Sentence case
+              </div>
+            </div>
+
+            <!-- Uppercase icon button with hover popover -->
+            <div class="relative group">
+              <button
+                type="button"
+                @click="project.toUpperCaseLyrics()"
+                aria-label="Uppercase"
+                class="inline-flex items-center justify-center text-slate-600 hover:text-brand-purple bg-slate-100 hover:bg-purple-50 border border-slate-200/80 hover:border-purple-200 p-1.5 rounded-lg transition-colors"
+              >
+                <CaseUpper class="w-4 h-4" />
+              </button>
+              <div
+                class="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 px-2.5 py-1 rounded-md bg-slate-900 text-white text-xs font-medium whitespace-nowrap shadow-md z-20"
+              >
+                Uppercase
+              </div>
+            </div>
+
+            <!-- Remove [Tags] icon button with hover popover -->
+            <div class="relative group">
+              <button
+                type="button"
+                @click="project.stripSectionHeaders()"
+                aria-label="Remove [Tags]"
+                class="inline-flex items-center justify-center text-slate-600 hover:text-brand-purple bg-slate-100 hover:bg-purple-50 border border-slate-200/80 hover:border-purple-200 p-1.5 rounded-lg transition-colors"
+              >
+                <Eraser class="w-4 h-4" />
+              </button>
+              <div
+                class="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity absolute bottom-full right-0 mb-1.5 px-2.5 py-1 rounded-md bg-slate-900 text-white text-xs font-medium whitespace-nowrap shadow-md z-20"
+              >
+                Remove [Tags]
+              </div>
+            </div>
+          </div>
         </div>
 
         <textarea

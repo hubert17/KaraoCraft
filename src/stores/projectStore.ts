@@ -394,6 +394,56 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  function syncCaseToAlignedLinesIfMatching() {
+    if (lines.value.length === 0) return;
+    const parsed = parseRawLyrics(rawLyrics.value);
+    if (parsed.length !== lines.value.length) return;
+    for (let i = 0; i < parsed.length; i++) {
+      if (parsed[i].words.length !== lines.value[i].words.length) return;
+    }
+    pushUndoSnapshot();
+    lines.value = lines.value.map((line, lIdx) => ({
+      ...line,
+      text: parsed[lIdx].text,
+      words: line.words.map((w, wIdx) => ({
+        ...w,
+        text: parsed[lIdx].words[wIdx],
+      })),
+    }));
+    syncedLyricsSnapshot.value = rawLyrics.value.trim();
+  }
+
+  function toSentenceCaseLine(line: string): string {
+    const lower = line.toLowerCase();
+    for (let i = 0; i < lower.length; i++) {
+      const ch = lower[i];
+      if (ch.toUpperCase() !== ch.toLowerCase()) {
+        return lower.slice(0, i) + ch.toUpperCase() + lower.slice(i + 1);
+      }
+    }
+    return lower;
+  }
+
+  function toSentenceCaseLyrics() {
+    if (!rawLyrics.value.trim()) return;
+    const normalized = rawLyrics.value
+      .split(CR + LF)
+      .join(LF)
+      .split(CR)
+      .join(LF);
+    rawLyrics.value = normalized
+      .split(LF)
+      .map((line) => toSentenceCaseLine(line))
+      .join(LF);
+    syncCaseToAlignedLinesIfMatching();
+  }
+
+  function toUpperCaseLyrics() {
+    if (!rawLyrics.value.trim()) return;
+    rawLyrics.value = rawLyrics.value.toUpperCase();
+    syncCaseToAlignedLinesIfMatching();
+  }
+
   function stripSectionHeaders() {
     const normalized = rawLyrics.value
       .split(CR + LF)
@@ -416,7 +466,7 @@ export const useProjectStore = defineStore('project', () => {
   async function runFullAlignment() {
     if (!rawLyrics.value.trim()) return;
     isAligning.value = true;
-    alignmentMessage.value = 'Analyzing vocal phrasing & syllables...';
+    alignmentMessage.value = 'Syncing lyrics to song...';
 
     try {
       let aligned: AlignedLyricLine[] | null = null;
@@ -426,7 +476,7 @@ export const useProjectStore = defineStore('project', () => {
       }
 
       if (isTauriEnv.value && systemCaps.value.whisperAvailable && vocalFile.value) {
-        alignmentMessage.value = `Running local AI phonetic forced alignment (${systemCaps.value.whisperEngine})...`;
+        alignmentMessage.value = 'Syncing lyrics to song...';
         try {
           const ext = vocalFile.value.name.split('.').pop() || 'mp3';
           const b64 = await fileToBase64(vocalFile.value);
@@ -1024,6 +1074,8 @@ export const useProjectStore = defineStore('project', () => {
     seekAudio,
     pushUndoSnapshot,
     undo,
+    toSentenceCaseLyrics,
+    toUpperCaseLyrics,
     stripSectionHeaders,
     runFullAlignment,
     submitSetup,
