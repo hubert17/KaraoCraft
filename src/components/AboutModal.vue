@@ -37,7 +37,7 @@ async function openExternal(url: string) {
                 KaraoCraft
               </h2>
               <span class="text-xs font-bold uppercase tracking-wider bg-purple-100 text-brand-purple px-2.5 py-0.5 rounded-full">
-                v0.2.0
+                v0.2.1
               </span>
             </div>
             <p class="text-sm text-slate-500 mt-1">
