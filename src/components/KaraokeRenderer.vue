@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useProjectStore } from '../stores/projectStore';
-import { buildFrameGroups } from '../services/subtitleExporter';
+import {
+  buildKaraokePresentationTimeline,
+  computeFadeOpacity,
+  type ScheduledKaraokeLine,
+} from '../services/subtitleExporter';
 import type { WordSegment } from '../services/alignmentEngine';
 
 const props = withDefaults(
@@ -42,35 +46,55 @@ onUnmounted(() => {
   resizeObserver?.disconnect();
 });
 
-const frameGroups = computed(() => buildFrameGroups(project.lines, project.duration));
+const timeline = computed(() =>
+  buildKaraokePresentationTimeline({
+    lines: project.lines,
+    durationSec: project.duration,
+    linesPerFrame: project.options.linesPerFrame,
+    title: project.title,
+    artist: project.artist,
+  })
+);
 
-// Active frame group for live video playback
-const activePlaybackGroup = computed(() => {
+const frameGroups = computed(() => timeline.value.groups);
+
+const activeTitleCard = computed(() => {
+  if (props.editableBox && !project.isPlaying) return null;
   const t = project.currentTime;
-  for (const g of frameGroups.value) {
-    if (t >= g.displayStartSec && t <= g.displayEndSec) {
-      return g;
-    }
+  const intro = timeline.value.introCard;
+  if (intro && t >= 0 && t <= intro.endSec) {
+    const opacity =
+      !project.isPlaying && t < intro.startSec + intro.fadeInSec
+        ? 1
+        : computeFadeOpacity(
+            Math.max(intro.startSec, t),
+            intro.startSec,
+            intro.endSec,
+            intro.fadeInSec,
+            intro.fadeOutSec
+          );
+    return { opacity };
+  }
+  const outro = timeline.value.outroCard;
+  if (outro && t >= outro.startSec && t <= outro.endSec) {
+    const opacity = computeFadeOpacity(
+      t,
+      outro.startSec,
+      outro.endSec,
+      outro.fadeInSec,
+      outro.fadeOutSec
+    );
+    return { opacity };
   }
   return null;
-});
-
-const showIntroCard = computed(() => {
-  if (props.editableBox && !project.isPlaying) return false;
-  const firstStart = frameGroups.value[0]?.displayStartSec ?? 4.0;
-  return (
-    (project.title.trim() !== '' || project.artist.trim() !== '') &&
-    firstStart >= 1.2 &&
-    project.currentTime >= 0 &&
-    project.currentTime < Math.min(firstStart - 0.2, 5.0)
-  );
 });
 
 // Sample preview lines used in Options mode so the user always sees a full frame with bounding box & colors
 const optionsPreviewLines = computed(() => {
   const targetCount = project.options.linesPerFrame;
   if (project.lines.length > 0) {
-    const firstFrame = frameGroups.value[0]?.lines ?? project.lines.slice(0, targetCount);
+    const firstNonBreak = frameGroups.value.find((g) => !g.isBreak);
+    const firstFrame = firstNonBreak?.lines ?? project.lines.slice(0, targetCount);
     if (firstFrame.length >= targetCount) {
       return firstFrame.slice(0, targetCount);
     }
@@ -105,11 +129,50 @@ const optionsPreviewLines = computed(() => {
   }));
 });
 
-const displayedLines = computed(() => {
+interface RenderedStageLine extends ScheduledKaraokeLine {
+  opacity: number;
+  topPercent: number;
+}
+
+const displayedStageLines = computed<RenderedStageLine[]>(() => {
   if (props.editableBox && !project.isPlaying) {
-    return optionsPreviewLines.value;
+    const preview = optionsPreviewLines.value;
+    const totalSlots = Math.max(project.options.linesPerFrame, preview.length);
+    return preview.map((line, idx) => ({
+      id: `preview-${line.id}`,
+      line,
+      slotIndex: idx,
+      actualCount: preview.length,
+      totalSlots,
+      displayStartSec: line.startSec,
+      displayEndSec: line.endSec,
+      fadeInSec: 0,
+      fadeOutSec: 0,
+      opacity: 1,
+      topPercent: ((idx + 0.5) / totalSlots) * 100,
+    }));
   }
-  return activePlaybackGroup.value?.lines ?? [];
+
+  const t = project.currentTime;
+  const active: RenderedStageLine[] = [];
+  for (const item of timeline.value.scheduledLines) {
+    if (t >= item.displayStartSec && t <= item.displayEndSec) {
+      const topPercent = item.isBreak ? 50 : ((item.slotIndex + 0.5) / item.totalSlots) * 100;
+      const opacity = computeFadeOpacity(
+        t,
+        item.displayStartSec,
+        item.displayEndSec,
+        item.fadeInSec,
+        item.fadeOutSec
+      );
+      active.push({
+        ...item,
+        opacity,
+        topPercent,
+      });
+    }
+  }
+  return active;
 });
 
 // Font size scaled proportionally to stageHeightPx (matching 1080p PlayResY in ASS)
@@ -144,12 +207,6 @@ function getWordFillPercent(word: WordSegment, lineIdx: number, wordIdx: number)
   if (t >= word.endSec) return 100;
   const dur = Math.max(0.01, word.endSec - word.startSec);
   return Math.min(100, Math.max(0, ((t - word.startSec) / dur) * 100));
-}
-
-function getLineTopPercent(idxInGroup: number, actualCount: number): number {
-  const totalSlots = Math.max(project.options.linesPerFrame, actualCount);
-  const topSlotOffset = (totalSlots - actualCount) * 0.5;
-  return ((topSlotOffset + idxInGroup + 0.5) / totalSlots) * 100;
 }
 
 // 4-Corner Bounding Box Drag Interaction (Slide 3)
@@ -241,10 +298,11 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
         maxWidth: '100%',
       }"
     >
-      <!-- Intro Song Title & Artist Card -->
+      <!-- Intro & Outro Song Title & Artist Card (with Fade In/Out) -->
       <div
-        v-if="showIntroCard"
+        v-if="activeTitleCard"
         class="absolute inset-0 flex flex-col items-center justify-center px-6 text-center pointer-events-none"
+        :style="{ opacity: activeTitleCard.opacity }"
       >
         <div
           class="font-bold tracking-tight leading-tight"
@@ -289,19 +347,20 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
             : undefined
         "
       >
-        <!-- Rendered Frame Lines -->
+        <!-- Rendered Scheduled Lines (with Rolling Slot Lookahead, --- Break ---, and Fade In/Out) -->
         <div
-          v-for="(line, lIdx) in displayedLines"
-          :key="line.id"
+          v-for="(item, lIdx) in displayedStageLines"
+          :key="item.id"
           class="absolute left-0 right-0 -translate-y-1/2 text-center whitespace-normal leading-tight px-2 pointer-events-none"
           :style="{
-            top: `${getLineTopPercent(lIdx, displayedLines.length)}%`,
+            top: `${item.topPercent}%`,
+            opacity: item.opacity,
             fontSize: `${scaledFontSizePx}px`,
             fontWeight: project.options.bold ? 700 : 400,
           }"
         >
           <span
-            v-for="(word, wIdx) in line.words"
+            v-for="(word, wIdx) in item.line.words"
             :key="word.id"
             class="relative inline-block mx-[0.14em]"
           >

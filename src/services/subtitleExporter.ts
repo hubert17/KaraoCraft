@@ -73,6 +73,93 @@ export interface FrameGroup {
   endSec: number;
   displayStartSec: number;
   displayEndSec: number;
+  isBreak?: boolean;
+}
+
+export interface ScheduledKaraokeLine {
+  id: string;
+  line: AlignedLyricLine;
+  slotIndex: number;
+  actualCount: number;
+  totalSlots: number;
+  displayStartSec: number;
+  displayEndSec: number;
+  fadeInSec: number;
+  fadeOutSec: number;
+  isBreak?: boolean;
+}
+
+export interface TitleCardWindow {
+  startSec: number;
+  endSec: number;
+  fadeInSec: number;
+  fadeOutSec: number;
+}
+
+export interface KaraokePresentationTimeline {
+  groups: FrameGroup[];
+  scheduledLines: ScheduledKaraokeLine[];
+  introCard: TitleCardWindow | null;
+  outroCard: TitleCardWindow | null;
+}
+
+const BREAK_GAP_THRESHOLD_SEC = 8.0;
+const LOOKAHEAD_MAX_GAP_SEC = 6.5;
+const DEFAULT_FADE_IN_SEC = 0.25;
+const DEFAULT_FADE_OUT_SEC = 0.3;
+
+export function computeFadeOpacity(
+  currentTimeSec: number,
+  startSec: number,
+  endSec: number,
+  fadeInSec = DEFAULT_FADE_IN_SEC,
+  fadeOutSec = DEFAULT_FADE_OUT_SEC
+): number {
+  if (currentTimeSec < startSec || currentTimeSec > endSec) return 0;
+  if (fadeInSec > 0 && currentTimeSec < startSec + fadeInSec) {
+    return Math.max(0, Math.min(1, (currentTimeSec - startSec) / fadeInSec));
+  }
+  if (fadeOutSec > 0 && currentTimeSec > endSec - fadeOutSec) {
+    return Math.max(0, Math.min(1, (endSec - currentTimeSec) / fadeOutSec));
+  }
+  return 1;
+}
+
+function createBreakLine(breakIdx: number, startSec: number, endSec: number): AlignedLyricLine {
+  const sweepStart = startSec + 0.25;
+  const sweepEnd = Math.max(sweepStart + 0.5, endSec - 0.3);
+  const span = sweepEnd - sweepStart;
+  const t1 = Number((sweepStart + span * 0.38).toFixed(3));
+  const t2 = Number((sweepStart + span * 0.62).toFixed(3));
+
+  return {
+    id: `break-line-${breakIdx}`,
+    text: '------------ Break ------------',
+    startSec: Number(sweepStart.toFixed(3)),
+    endSec: Number(sweepEnd.toFixed(3)),
+    stanzaBreakBefore: true,
+    frameIndex: -100 - breakIdx,
+    words: [
+      {
+        id: `break-word-${breakIdx}-0`,
+        text: '------------',
+        startSec: Number(sweepStart.toFixed(3)),
+        endSec: t1,
+      },
+      {
+        id: `break-word-${breakIdx}-1`,
+        text: 'Break',
+        startSec: t1,
+        endSec: t2,
+      },
+      {
+        id: `break-word-${breakIdx}-2`,
+        text: '------------',
+        startSec: t2,
+        endSec: Number(sweepEnd.toFixed(3)),
+      },
+    ],
+  };
 }
 
 export function buildFrameGroups(lines: AlignedLyricLine[], durationSec: number): FrameGroup[] {
@@ -86,7 +173,7 @@ export function buildFrameGroups(lines: AlignedLyricLine[], durationSec: number)
   }
 
   const keys = Array.from(map.keys()).sort((a, b) => a - b);
-  const groups: FrameGroup[] = keys.map((frameIndex) => {
+  const rawGroups: FrameGroup[] = keys.map((frameIndex) => {
     const groupLines = map.get(frameIndex)!;
     const startSec = groupLines[0].startSec;
     const endSec = groupLines[groupLines.length - 1].endSec;
@@ -100,24 +187,182 @@ export function buildFrameGroups(lines: AlignedLyricLine[], durationSec: number)
     };
   });
 
-  // Compute smooth pre-roll and post-hold windows without overlapping adjacent frames
-  for (let i = 0; i < groups.length; i++) {
-    const cur = groups[i];
-    const prevEnd = i > 0 ? groups[i - 1].displayEndSec : 0;
-    const nextStart = i < groups.length - 1 ? groups[i + 1].startSec : Math.max(durationSec, cur.endSec + 1.5);
+  // Compute smooth pre-roll and extended post-hold (~2.0s on moderate gaps)
+  for (let i = 0; i < rawGroups.length; i++) {
+    const cur = rawGroups[i];
+    const prevEnd = i > 0 ? rawGroups[i - 1].displayEndSec : 0;
+    const nextStart =
+      i < rawGroups.length - 1 ? rawGroups[i + 1].startSec : Math.max(durationSec, cur.endSec + 2.5);
 
-    const idealLeadIn = Math.max(prevEnd + 0.08, cur.startSec - 1.0);
-    cur.displayStartSec = Math.min(cur.startSec, idealLeadIn);
+    const idealLeadIn = Math.max(prevEnd + 0.12, cur.startSec - 1.1);
+    cur.displayStartSec = Number(Math.min(cur.startSec, idealLeadIn).toFixed(3));
 
     const gapToNext = nextStart - cur.endSec;
-    const hold = gapToNext > 1.2 ? 0.55 : Math.max(0.05, gapToNext * 0.45);
-    cur.displayEndSec = Math.min(nextStart - 0.05, cur.endSec + hold);
+    let hold: number;
+    if (gapToNext >= BREAK_GAP_THRESHOLD_SEC) {
+      // Hold for ~2.0s before fading out into the --- Break --- banner
+      hold = 2.0;
+    } else if (gapToNext >= 2.6) {
+      // Moderate gap: retain lyrics set for ~2.0-2.2s before fading out
+      hold = Math.min(2.2, gapToNext - 1.0);
+    } else if (gapToNext > 1.2) {
+      hold = Math.min(1.4, gapToNext * 0.6);
+    } else {
+      hold = Math.max(0.08, gapToNext * 0.45);
+    }
+
+    cur.displayEndSec = Number(Math.min(nextStart - 0.08, cur.endSec + hold).toFixed(3));
     if (cur.displayEndSec <= cur.endSec) {
-      cur.displayEndSec = cur.endSec + 0.05;
+      cur.displayEndSec = Number((cur.endSec + 0.05).toFixed(3));
     }
   }
 
-  return groups;
+  // Insert automatic --- Break --- groups whenever gap between groups >= BREAK_GAP_THRESHOLD_SEC (8.0s)
+  const finalGroups: FrameGroup[] = [];
+  let breakCounter = 0;
+
+  for (let i = 0; i < rawGroups.length; i++) {
+    const cur = rawGroups[i];
+    finalGroups.push(cur);
+
+    if (i < rawGroups.length - 1) {
+      const next = rawGroups[i + 1];
+      const rawGap = next.startSec - cur.endSec;
+      if (rawGap >= BREAK_GAP_THRESHOLD_SEC) {
+        const breakStart = Number((cur.displayEndSec + 0.35).toFixed(3));
+        const breakEnd = Number((next.displayStartSec - 0.35).toFixed(3));
+        if (breakEnd - breakStart >= 2.0) {
+          const bLine = createBreakLine(breakCounter, breakStart, breakEnd);
+          finalGroups.push({
+            frameIndex: bLine.frameIndex,
+            lines: [bLine],
+            startSec: bLine.startSec,
+            endSec: bLine.endSec,
+            displayStartSec: breakStart,
+            displayEndSec: breakEnd,
+            isBreak: true,
+          });
+          breakCounter++;
+        }
+      }
+    }
+  }
+
+  return finalGroups;
+}
+
+export function buildKaraokePresentationTimeline(params: {
+  lines: AlignedLyricLine[];
+  durationSec: number;
+  linesPerFrame: number;
+  title?: string;
+  artist?: string;
+}): KaraokePresentationTimeline {
+  const { lines, durationSec, linesPerFrame, title = '', artist = '' } = params;
+  const groups = buildFrameGroups(lines, durationSec);
+  const slotCapacity = Math.max(1, linesPerFrame);
+  const hasMetadata = Boolean(title.trim() || artist.trim());
+
+  // 1. Intro Title & Artist Card (auto-sized before first lyric frame)
+  let introCard: TitleCardWindow | null = null;
+  const firstFrameDisplayStart = groups[0]?.displayStartSec ?? 4.0;
+  if (hasMetadata && firstFrameDisplayStart >= 1.4) {
+    const introStart = 0.2;
+    const introEnd = Number(Math.max(1.1, Math.min(firstFrameDisplayStart - 0.4, 11.0)).toFixed(3));
+    if (introEnd > introStart + 0.6) {
+      introCard = {
+        startSec: introStart,
+        endSec: introEnd,
+        fadeInSec: 0.3,
+        fadeOutSec: 0.35,
+      };
+    }
+  }
+
+  // 2. Build per-line scheduled display windows with Rolling Slot Lookahead
+  // When singing the LAST WORD of the last line of group i (and group i+1 is a normal lyric stanza within LOOKAHEAD_MAX_GAP_SEC),
+  // Slot 0 of group i swaps to Line 0 of group i+1 so the singer sees the upcoming line right as they finish the last word.
+  const lookaheadSwapTimeForGroup = new Map<number, number>();
+  for (let i = 0; i < groups.length - 1; i++) {
+    const cur = groups[i];
+    const next = groups[i + 1];
+    if (cur.isBreak || next.isBreak) continue;
+    if (cur.lines.length < 2 || next.lines.length === 0) continue;
+
+    const gap = next.startSec - cur.endSec;
+    if (gap <= LOOKAHEAD_MAX_GAP_SEC) {
+      const firstLineEnd = cur.lines[0].endSec;
+      const lastLine = cur.lines[cur.lines.length - 1];
+      const lastWord = lastLine.words[lastLine.words.length - 1];
+      const lastWordStart = lastWord ? lastWord.startSec : lastLine.startSec;
+
+      const swapSec = Number(Math.max(firstLineEnd + 0.35, lastWordStart).toFixed(3));
+      // Only trigger lookahead if swapSec is strictly before cur.displayEndSec and next.displayStartSec
+      if (swapSec < cur.displayEndSec - 0.15 && swapSec < next.displayStartSec - 0.1) {
+        lookaheadSwapTimeForGroup.set(i, swapSec);
+      }
+    }
+  }
+
+  const scheduledLines: ScheduledKaraokeLine[] = [];
+  for (let i = 0; i < groups.length; i++) {
+    const group = groups[i];
+    const totalSlots = group.isBreak ? 1 : Math.max(slotCapacity, group.lines.length);
+    const earlySwapOutSec = lookaheadSwapTimeForGroup.get(i);
+    const earlySwapInSec = i > 0 ? lookaheadSwapTimeForGroup.get(i - 1) : undefined;
+
+    group.lines.forEach((line, idxInGroup) => {
+      let lineStart = group.displayStartSec;
+      let lineEnd = group.displayEndSec;
+
+      // If this is Line 0 of group i and group i-1 swapped it in early via lookahead:
+      if (idxInGroup === 0 && earlySwapInSec !== undefined) {
+        lineStart = earlySwapInSec;
+      }
+
+      // If this is Line 0 of group i and it swaps out early to show group i+1's first line:
+      // Strictly cap at earlySwapOutSec - 0.05 so it NEVER overlaps the incoming lookahead line.
+      if (idxInGroup === 0 && earlySwapOutSec !== undefined) {
+        lineEnd = Number((earlySwapOutSec - 0.05).toFixed(3));
+      }
+
+      scheduledLines.push({
+        id: `${group.frameIndex}-${line.id}`,
+        line,
+        slotIndex: idxInGroup,
+        actualCount: group.lines.length,
+        totalSlots,
+        displayStartSec: lineStart,
+        displayEndSec: lineEnd,
+        fadeInSec: DEFAULT_FADE_IN_SEC,
+        fadeOutSec: DEFAULT_FADE_OUT_SEC,
+        isBreak: group.isBreak,
+      });
+    });
+  }
+
+  // 3. Outro Title & Artist Card (auto-sized after final lyric frame fades out)
+  let outroCard: TitleCardWindow | null = null;
+  const lastGroup = groups[groups.length - 1];
+  if (hasMetadata && lastGroup && durationSec - lastGroup.displayEndSec >= 2.5) {
+    const outroStart = Number((lastGroup.displayEndSec + 0.5).toFixed(3));
+    const outroEnd = Number(Math.min(durationSec - 0.2, Math.max(outroStart + 2.0, durationSec - 0.3)).toFixed(3));
+    if (outroEnd > outroStart + 1.0) {
+      outroCard = {
+        startSec: outroStart,
+        endSec: outroEnd,
+        fadeInSec: 0.35,
+        fadeOutSec: 0.4,
+      };
+    }
+  }
+
+  return {
+    groups,
+    scheduledLines,
+    introCard,
+    outroCard,
+  };
 }
 
 /**
@@ -168,66 +413,79 @@ export function generateAssSubtitle(params: {
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
   ];
 
-  const groups = buildFrameGroups(lines, durationSec);
+  const timeline = buildKaraokePresentationTimeline({
+    lines,
+    durationSec,
+    linesPerFrame: options.linesPerFrame,
+    title,
+    artist,
+  });
 
-  // Add Intro Title Card if there is room before first frame
-  const firstFrameDisplayStart = groups[0]?.displayStartSec ?? 4.0;
-  if ((title.trim() || artist.trim()) && firstFrameDisplayStart >= 1.2) {
-    const introEnd = Math.max(0.9, Math.min(firstFrameDisplayStart - 0.25, 5.0));
-    const centerX = Math.round(playResX * 0.5);
-    const titleY = Math.round(playResY * 0.44);
-    const artistY = Math.round(playResY * 0.56);
+  const centerX = Math.round(playResX * 0.5);
+  const titleY = Math.round(playResY * 0.44);
+  const artistY = Math.round(playResY * 0.56);
 
+  const emitTitleArtistCard = (card: TitleCardWindow) => {
+    const fi = Math.round(card.fadeInSec * 1000);
+    const fo = Math.round(card.fadeOutSec * 1000);
     if (title.trim()) {
       const safeTitle = escapeAssText(title.trim());
       out.push(
-        `Dialogue: 0,${formatAssTimestamp(0.15)},${formatAssTimestamp(introEnd)},TitleCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${titleY})${BS}fad(250,300)}${safeTitle}`
+        `Dialogue: 0,${formatAssTimestamp(card.startSec)},${formatAssTimestamp(card.endSec)},TitleCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${titleY})${BS}fad(${fi},${fo})}${safeTitle}`
       );
     }
     if (artist.trim()) {
       const safeArtist = escapeAssText(artist.trim());
       out.push(
-        `Dialogue: 0,${formatAssTimestamp(0.15)},${formatAssTimestamp(introEnd)},ArtistCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${artistY})${BS}fad(250,300)}${safeArtist}`
+        `Dialogue: 0,${formatAssTimestamp(card.startSec)},${formatAssTimestamp(card.endSec)},ArtistCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${artistY})${BS}fad(${fi},${fo})}${safeArtist}`
       );
     }
+  };
+
+  // 1. Intro Title & Artist Card
+  if (timeline.introCard) {
+    emitTitleArtistCard(timeline.introCard);
   }
 
-  // Emit frame-grouped karaoke lines positioned inside the 4-corner bounding box
+  // 2. Scheduled Karaoke Lines (including Rolling Slot Lookahead & --- Break --- banners)
   const boxCenterX = Math.round((options.boxLeft + options.boxWidth * 0.5) * playResX);
   const boxTopPx = options.boxTop * playResY;
   const boxHeightPx = options.boxHeight * playResY;
-  const slotCount = Math.max(1, options.linesPerFrame);
 
-  for (const group of groups) {
-    const totalSlots = Math.max(slotCount, group.lines.length);
-    const actualCount = group.lines.length;
-    // Center smaller stanzas nicely inside the bounding box
-    const topSlotOffset = (totalSlots - actualCount) * 0.5;
+  for (const item of timeline.scheduledLines) {
+    // Use fixed slot grid (0..totalSlots-1) for lyric lines so Slot 0 is always at the exact same Y coordinate
+    // across 2-line, 3-line, and 4-line stanzas and never collides with Slot 1 during lookahead.
+    const normalizedSlot = item.isBreak ? 0.5 : (item.slotIndex + 0.5) / item.totalSlots;
+    const lineY = Math.round(boxTopPx + normalizedSlot * boxHeightPx);
+    const fadeInMs = Math.round(item.fadeInSec * 1000);
+    const fadeOutMs = Math.round(item.fadeOutSec * 1000);
 
-    group.lines.forEach((line, idxInGroup) => {
-      const normalizedSlot = (topSlotOffset + idxInGroup + 0.5) / totalSlots;
-      const lineY = Math.round(boxTopPx + normalizedSlot * boxHeightPx);
+    let cursorSec = item.displayStartSec;
+    const chunks: string[] = [
+      `{${BS}an5${BS}pos(${boxCenterX},${lineY})${BS}fad(${fadeInMs},${fadeOutMs})}`,
+    ];
 
-      let cursorSec = group.displayStartSec;
-      const chunks: string[] = [`{${BS}an5${BS}pos(${boxCenterX},${lineY})}`];
-
-      line.words.forEach((word, wIdx) => {
-        const gapSec = word.startSec - cursorSec;
-        if (gapSec > 0.01) {
-          const gapCs = Math.max(1, Math.round(gapSec * 100));
-          chunks.push(`{${BS}k${gapCs}}`);
-          cursorSec += gapCs / 100;
-        }
-        const durCs = Math.max(1, Math.round((word.endSec - Math.max(cursorSec, word.startSec)) * 100));
-        const suffix = wIdx < line.words.length - 1 ? ' ' : '';
-        chunks.push(`{${BS}kf${durCs}}${escapeAssText(word.text)}${suffix}`);
-        cursorSec = word.endSec;
-      });
-
-      out.push(
-        `Dialogue: 0,${formatAssTimestamp(group.displayStartSec)},${formatAssTimestamp(group.displayEndSec)},Karaoke,,${marginL},${marginR},0,,${chunks.join('')}`
-      );
+    item.line.words.forEach((word, wIdx) => {
+      const gapSec = word.startSec - cursorSec;
+      if (gapSec > 0.01) {
+        const gapCs = Math.max(1, Math.round(gapSec * 100));
+        chunks.push(`{${BS}k${gapCs}}`);
+        cursorSec += gapCs / 100;
+      }
+      const durCs = Math.max(1, Math.round((word.endSec - Math.max(cursorSec, word.startSec)) * 100));
+      const suffix = wIdx < item.line.words.length - 1 ? ' ' : '';
+      chunks.push(`{${BS}kf${durCs}}${escapeAssText(word.text)}${suffix}`);
+      cursorSec = word.endSec;
     });
+
+    out.push(
+      `Dialogue: 0,${formatAssTimestamp(item.displayStartSec)},${formatAssTimestamp(item.displayEndSec)},Karaoke,,${marginL},${marginR},0,,${chunks.join('')}`
+    );
+  }
+
+  // 3. Outro Title & Artist Card
+  if (timeline.outroCard) {
+    emitTitleArtistCard(timeline.outroCard);
   }
 
   return out.join(LF) + LF;

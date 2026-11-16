@@ -12,6 +12,7 @@ import {
   parseRawLyrics,
 } from '../src/services/alignmentEngine.ts';
 import {
+  buildKaraokePresentationTimeline,
   generateAssSubtitle,
   generateEnhancedLrc,
   hexToAssColor,
@@ -169,6 +170,111 @@ describe('KaraoCraft Alignment & Subtitle Engine', () => {
 
     // Reject malformed JSON syntax
     assert.throws(() => parseAndValidateProjectJson('{bad json'), /Invalid JSON file/);
+  });
+
+  it('schedules Intro/Outro cards, Rolling Slot Lookahead, 2s moderate-gap hold, and --- Break --- banners', () => {
+    const lines = [
+      {
+        id: 'line-0',
+        text: 'anata no se-eta',
+        startSec: 32.6,
+        endSec: 35.3,
+        stanzaBreakBefore: false,
+        frameIndex: 0,
+        words: [{ id: 'w-0', text: 'anata no se-eta', startSec: 32.6, endSec: 35.3 }],
+      },
+      {
+        id: 'line-1',
+        text: 'sodeguchi tsumande',
+        startSec: 36.3,
+        endSec: 39.2,
+        stanzaBreakBefore: false,
+        frameIndex: 0,
+        words: [{ id: 'w-1', text: 'sodeguchi tsumande', startSec: 36.3, endSec: 39.2 }],
+      },
+      {
+        id: 'line-2',
+        text: 'utsumuku dake nante',
+        startSec: 39.8,
+        endSec: 43.8,
+        stanzaBreakBefore: false,
+        frameIndex: 0,
+        words: [
+          { id: 'w-2a', text: 'utsumuku', startSec: 39.8, endSec: 41.5 },
+          { id: 'w-2b', text: 'dake', startSec: 41.6, endSec: 42.1 },
+          { id: 'w-2c', text: 'nante', startSec: 42.25, endSec: 43.8 },
+        ],
+      },
+      // Next stanza follows after 1.9s gap -> triggers Rolling Slot Lookahead ONLY at last word 'nante' (42.25s)!
+      {
+        id: 'line-3',
+        text: 'kaeritaku nai',
+        startSec: 45.7,
+        endSec: 48.9,
+        stanzaBreakBefore: true,
+        frameIndex: 1,
+        words: [{ id: 'w-3', text: 'kaeritaku nai', startSec: 45.7, endSec: 48.9 }],
+      },
+      {
+        id: 'line-4',
+        text: 'soba ni itai no',
+        startSec: 49.5,
+        endSec: 52.7,
+        stanzaBreakBefore: false,
+        frameIndex: 1,
+        words: [{ id: 'w-4', text: 'soba ni itai no', startSec: 49.5, endSec: 52.7 }],
+      },
+      // Next stanza after a 15-second instrumental break (52.7s -> 68.0s) -> triggers --- Break --- banner!
+      {
+        id: 'line-5',
+        text: 'dakiagete tsuretette',
+        startSec: 68.0,
+        endSec: 72.0,
+        stanzaBreakBefore: true,
+        frameIndex: 2,
+        words: [{ id: 'w-5', text: 'dakiagete tsuretette', startSec: 68.0, endSec: 72.0 }],
+      },
+    ];
+
+    const tl = buildKaraokePresentationTimeline({
+      lines,
+      durationSec: 85.0,
+      linesPerFrame: 4,
+      title: 'Second Love',
+      artist: 'Takao Kisugi',
+    });
+
+    // 1. Intro & Outro Title/Artist cards should both be scheduled
+    assert.ok(tl.introCard, 'Expected Intro Title/Artist card before 32.6s');
+    assert.ok(tl.outroCard, 'Expected Outro Title/Artist card after 72.0s');
+
+    // 2a. Before the last word ('utsumuku' / 'dake' at t=41.0s), original Slot 0 ('anata no se-eta') is still intact!
+    const visibleAt41 = tl.scheduledLines.filter(
+      (s) => 41.0 >= s.displayStartSec && 41.0 <= s.displayEndSec
+    );
+    const textsAt41 = visibleAt41.map((s) => s.line.text);
+    assert.ok(textsAt41.includes('anata no se-eta'), 'First line should still be shown before the last word starts');
+    assert.ok(!textsAt41.includes('kaeritaku nai'), 'Lookahead line should NOT appear before the last word starts');
+
+    // 2b. During the last word ('nante' at t=42.8s), Slot 0 swaps to 'kaeritaku nai' with zero slot collision!
+    const visibleAt428 = tl.scheduledLines.filter(
+      (s) => 42.8 >= s.displayStartSec && 42.8 <= s.displayEndSec
+    );
+    const textsAt428 = visibleAt428.map((s) => s.line.text);
+    assert.ok(!textsAt428.includes('anata no se-eta'), 'First line should have swapped out at 42.25s');
+    assert.ok(
+      textsAt428.includes('kaeritaku nai'),
+      'Next stanza first line (kaeritaku nai) should be visible in Slot 0 during last word'
+    );
+    assert.ok(textsAt428.includes('utsumuku dake nante'));
+    const slotsAt428 = new Set(visibleAt428.map((s) => s.slotIndex));
+    assert.equal(slotsAt428.size, visibleAt428.length, 'No two visible lines may share the same slotIndex');
+
+    // 3. Long gap (52.7s -> 68.0s): Frame 1 holds for ~2.0s (until 54.7s), then --- Break --- appears!
+    const breakScheduled = tl.scheduledLines.find((s) => s.isBreak);
+    assert.ok(breakScheduled, 'Expected automatic --- Break --- line in 15.3s instrumental gap');
+    assert.equal(breakScheduled.line.text, '------------ Break ------------');
+    assert.ok(breakScheduled.displayStartSec >= 54.9 && breakScheduled.displayEndSec <= 66.8);
   });
 
   it('generates valid ASS karaoke script and renders cleanly through FFmpeg libass', () => {
