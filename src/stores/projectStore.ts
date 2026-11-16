@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import { audioEngine, fileToBase64, type AudioMixMode } from '../services/audioEngine';
+import { audioEngine, base64ToFile, fileToBase64, type AudioMixMode } from '../services/audioEngine';
 import {
   alignLyricsWithWaveform,
   alignLyricsWithWhisperWords,
@@ -15,6 +15,7 @@ import {
   generateAssSubtitle,
   generateEnhancedLrc,
   getResolutionDimensions,
+  parseAndValidateProjectJson,
   triggerBrowserDownload,
   type KaraokeVisualOptions,
 } from '../services/subtitleExporter';
@@ -42,6 +43,18 @@ interface RenderMp4Response {
   encoderUsed: string;
 }
 
+interface OpenedProjectFile {
+  filePath: string;
+  content: string;
+}
+
+interface LocalAudioFilePayload {
+  filePath: string;
+  fileName: string;
+  base64Data: string;
+  mimeType: string;
+}
+
 const LF = String.fromCharCode(10);
 const CR = String.fromCharCode(13);
 
@@ -65,11 +78,57 @@ export const useProjectStore = defineStore('project', () => {
   // Audio Files & Decoded Waveform
   const vocalFile = ref<File | null>(null);
   const vocalFileName = ref('');
+  const vocalFilePath = ref('');
   const isDecodingAudio = ref(false);
   const audioError = ref<string | null>(null);
 
   const instrumentalFile = ref<File | null>(null);
   const instrumentalFileName = ref('');
+  const instrumentalFilePath = ref('');
+
+  // Project File Persistence State
+  const projectFilePath = ref<string | null>(null);
+  const projectSaveStatus = ref<string | null>(null);
+  const projectFileError = ref<string | null>(null);
+  let saveStatusTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const LAST_AUDIO_DIR_KEY = 'karaocraft:lastAudioDir';
+  const LAST_PROJECT_DIR_KEY = 'karaocraft:lastProjectDir';
+
+  const lastAudioDir = ref<string>(
+    typeof localStorage !== 'undefined' ? localStorage.getItem(LAST_AUDIO_DIR_KEY) || '' : ''
+  );
+  const lastProjectDir = ref<string>(
+    typeof localStorage !== 'undefined' ? localStorage.getItem(LAST_PROJECT_DIR_KEY) || '' : ''
+  );
+
+  function extractParentDir(filePath: string): string {
+    const trimmed = filePath.trim();
+    const slashIdx = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf(String.fromCharCode(92)));
+    return slashIdx > 0 ? trimmed.slice(0, slashIdx) : '';
+  }
+
+  function rememberAudioPath(filePath: string) {
+    const dir = extractParentDir(filePath);
+    if (!dir) return;
+    lastAudioDir.value = dir;
+    try {
+      localStorage.setItem(LAST_AUDIO_DIR_KEY, dir);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  function rememberProjectPath(filePath: string) {
+    const dir = extractParentDir(filePath);
+    if (!dir) return;
+    lastProjectDir.value = dir;
+    try {
+      localStorage.setItem(LAST_PROJECT_DIR_KEY, dir);
+    } catch {
+      // Ignore storage errors
+    }
+  }
 
   const duration = ref(0);
   const waveformPeaks = ref<Float32Array | null>(null);
@@ -187,12 +246,28 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  async function selectVocalFile(file: File) {
+  async function selectVocalFile(file: File, explicitPath?: string) {
     audioError.value = null;
     isDecodingAudio.value = true;
     vocalFile.value = file;
     vocalFileName.value = file.name;
     inferMetadataFromFilename(file.name);
+
+    if (explicitPath) {
+      vocalFilePath.value = explicitPath;
+      rememberAudioPath(explicitPath);
+    } else if (isTauriEnv.value) {
+      try {
+        const resolved = await invoke<string | null>('resolve_local_audio_path', {
+          fileName: file.name,
+          fileSize: file.size,
+        });
+        vocalFilePath.value = resolved || '';
+        if (resolved) rememberAudioPath(resolved);
+      } catch {
+        vocalFilePath.value = '';
+      }
+    }
 
     try {
       const decoded = await audioEngine.loadVocalFile(file);
@@ -209,19 +284,69 @@ export const useProjectStore = defineStore('project', () => {
           : 'Could not decode this audio format. Try MP3, WAV, M4A, or FLAC.';
       vocalFile.value = null;
       vocalFileName.value = '';
+      vocalFilePath.value = '';
     } finally {
       isDecodingAudio.value = false;
     }
   }
 
-  function selectInstrumentalFile(file: File | null) {
+  async function selectInstrumentalFile(file: File | null, explicitPath?: string) {
     instrumentalFile.value = file;
     instrumentalFileName.value = file ? file.name : '';
+    if (!file) {
+      instrumentalFilePath.value = '';
+    } else if (explicitPath) {
+      instrumentalFilePath.value = explicitPath;
+      rememberAudioPath(explicitPath);
+    } else if (isTauriEnv.value) {
+      try {
+        const resolved = await invoke<string | null>('resolve_local_audio_path', {
+          fileName: file.name,
+          fileSize: file.size,
+        });
+        instrumentalFilePath.value = resolved || '';
+        if (resolved) rememberAudioPath(resolved);
+      } catch {
+        instrumentalFilePath.value = '';
+      }
+    }
     audioEngine.loadInstrumentalFile(file);
     if (file) {
       setMixMode('instrumental');
     } else {
       setMixMode('vocal');
+    }
+  }
+
+  async function browseVocalFile(): Promise<boolean> {
+    if (!isTauriEnv.value) return false;
+    try {
+      const payload = await invoke<LocalAudioFilePayload | null>('open_audio_dialog', {
+        prompt: 'Select Vocal Stem Audio File',
+        initialDir: vocalFilePath.value || lastAudioDir.value || null,
+      });
+      if (!payload) return true; // User cancelled dialog
+      const fileObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+      await selectVocalFile(fileObj, payload.filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function browseInstrumentalFile(): Promise<boolean> {
+    if (!isTauriEnv.value) return false;
+    try {
+      const payload = await invoke<LocalAudioFilePayload | null>('open_audio_dialog', {
+        prompt: 'Select Instrumental Backing Track',
+        initialDir: instrumentalFilePath.value || vocalFilePath.value || lastAudioDir.value || null,
+      });
+      if (!payload) return true; // User cancelled dialog
+      const fileObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+      await selectInstrumentalFile(fileObj, payload.filePath);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -557,47 +682,218 @@ export const useProjectStore = defineStore('project', () => {
     triggerBrowserDownload(`${safeName}.lrc`, content, 'text/plain;charset=utf-8');
   }
 
-  function saveProjectFile() {
+  function showSaveConfirmation(label: string) {
+    projectSaveStatus.value = label;
+    if (saveStatusTimer) clearTimeout(saveStatusTimer);
+    saveStatusTimer = setTimeout(() => {
+      projectSaveStatus.value = null;
+    }, 2800);
+  }
+
+  function serializeProjectJson(): string {
     const payload = {
+      app: 'KaraoCraft',
       version: 2,
       savedAt: new Date().toISOString(),
       title: title.value,
       artist: artist.value,
       rawLyrics: rawLyrics.value,
       vocalFileName: vocalFileName.value,
+      vocalFilePath: vocalFilePath.value,
       instrumentalFileName: instrumentalFileName.value,
+      instrumentalFilePath: instrumentalFilePath.value,
       duration: duration.value,
       options: options.value,
       lines: lines.value,
     };
-    const safeName = sanitizeFileBase(title.value, 'KaraoCraft_Project');
-    triggerBrowserDownload(
-      `${safeName}.karaocraft.json`,
-      JSON.stringify(payload, null, 2),
-      'application/json;charset=utf-8'
-    );
+    return JSON.stringify(payload, null, 2);
   }
 
-  async function loadProjectFile(file: File) {
-    const text = await file.text();
-    const data = JSON.parse(text);
+  async function saveProjectFile() {
+    projectFileError.value = null;
+    const content = serializeProjectJson();
+
+    if (isTauriEnv.value) {
+      if (projectFilePath.value) {
+        try {
+          const savedPath = await invoke<string>('write_project_file', {
+            filePath: projectFilePath.value,
+            content,
+          });
+          projectFilePath.value = savedPath;
+          rememberProjectPath(savedPath);
+          showSaveConfirmation('Saved');
+          return;
+        } catch (err) {
+          projectFileError.value = err instanceof Error ? err.message : String(err);
+          return;
+        }
+      }
+      await saveProjectFileAs();
+      return;
+    }
+
+    const safeName = sanitizeFileBase(title.value, 'KaraoCraft_Project');
+    triggerBrowserDownload(`${safeName}.json`, content, 'application/json;charset=utf-8');
+    showSaveConfirmation('Saved');
+  }
+
+  async function saveProjectFileAs() {
+    projectFileError.value = null;
+    const content = serializeProjectJson();
+    const safeName = sanitizeFileBase(title.value, 'KaraoCraft_Project');
+    const defaultName = `${safeName}.json`;
+
+    if (isTauriEnv.value) {
+      try {
+        const chosenPath = await invoke<string | null>('save_project_dialog', {
+          defaultName,
+          currentPath: projectFilePath.value,
+          initialDir: lastProjectDir.value || null,
+          content,
+        });
+        if (chosenPath) {
+          projectFilePath.value = chosenPath;
+          rememberProjectPath(chosenPath);
+          showSaveConfirmation('Saved');
+        }
+      } catch (err) {
+        projectFileError.value = err instanceof Error ? err.message : String(err);
+      }
+      return;
+    }
+
+    triggerBrowserDownload(defaultName, content, 'application/json;charset=utf-8');
+    showSaveConfirmation('Saved');
+  }
+
+  async function applyValidatedProjectJson(rawText: string, sourceFilePath?: string) {
+    projectFileError.value = null;
+    const data = parseAndValidateProjectJson(rawText);
+
     if (typeof data.title === 'string') title.value = data.title;
     if (typeof data.artist === 'string') artist.value = data.artist;
-    if (typeof data.rawLyrics === 'string') {
-      rawLyrics.value = data.rawLyrics;
-      syncedLyricsSnapshot.value = data.rawLyrics.trim();
-    }
+    rawLyrics.value = data.rawLyrics;
+    syncedLyricsSnapshot.value = data.rawLyrics.trim();
+
     if (data.options && typeof data.options === 'object') {
       options.value = { ...options.value, ...data.options };
     }
-    if (Array.isArray(data.lines) && data.lines.length > 0) {
-      lines.value = data.lines;
-      assignFramesToLines(lines.value, options.value.linesPerFrame);
-      if (!duration.value && typeof data.duration === 'number') {
-        duration.value = data.duration;
+
+    lines.value = data.lines;
+    assignFramesToLines(lines.value, options.value.linesPerFrame);
+    if (typeof data.duration === 'number' && data.duration > 0) {
+      duration.value = data.duration;
+    }
+
+    if (typeof data.vocalFileName === 'string') vocalFileName.value = data.vocalFileName;
+    if (typeof data.vocalFilePath === 'string') vocalFilePath.value = data.vocalFilePath;
+    if (typeof data.instrumentalFileName === 'string') instrumentalFileName.value = data.instrumentalFileName;
+    if (typeof data.instrumentalFilePath === 'string') instrumentalFilePath.value = data.instrumentalFilePath;
+
+    if (sourceFilePath) {
+      projectFilePath.value = sourceFilePath;
+      rememberProjectPath(sourceFilePath);
+    }
+
+    screen.value = 'editor';
+    activeTab.value = 'line-timings';
+    selectedLineIndex.value = 0;
+    selectedWordId.value = lines.value[0]?.words[0]?.id ?? null;
+
+    // Reload vocal & instrumental stems from their original file paths in-place (without copying or moving)
+    if (isTauriEnv.value && (data.vocalFilePath || data.vocalFileName)) {
+      try {
+        const payload = await invoke<LocalAudioFilePayload>('read_local_audio_file', {
+          filePath: data.vocalFilePath || null,
+          fileName: data.vocalFileName || null,
+        });
+        const fileObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+        await selectVocalFile(fileObj, payload.filePath);
+      } catch {
+        audioError.value = `Vocal audio file not found at saved path (${data.vocalFilePath || data.vocalFileName}). You can re-select it in the Basics tab.`;
       }
-      screen.value = 'editor';
-      activeTab.value = 'line-timings';
+    }
+
+    if (isTauriEnv.value && (data.instrumentalFilePath || data.instrumentalFileName)) {
+      try {
+        const payload = await invoke<LocalAudioFilePayload>('read_local_audio_file', {
+          filePath: data.instrumentalFilePath || null,
+          fileName: data.instrumentalFileName || null,
+        });
+        const instObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+        await selectInstrumentalFile(instObj, payload.filePath);
+      } catch {
+        // Non-fatal if optional instrumental stem was moved
+      }
+    }
+  }
+
+  async function openProjectFromDialog() {
+    projectFileError.value = null;
+    if (!isTauriEnv.value) return false;
+    try {
+      const opened = await invoke<OpenedProjectFile | null>('open_project_dialog', {
+        initialDir: projectFilePath.value || lastProjectDir.value || null,
+      });
+      if (!opened) return true; // User cancelled dialog
+      await applyValidatedProjectJson(opened.content, opened.filePath);
+      return true;
+    } catch (err) {
+      projectFileError.value =
+        err instanceof Error
+          ? err.message
+          : 'Invalid KaraoCraft project file: this JSON file is not a valid KaraoCraft project.';
+      return true;
+    }
+  }
+
+  function newProject() {
+    audioEngine.reset();
+    vocalFile.value = null;
+    vocalFileName.value = '';
+    vocalFilePath.value = '';
+    instrumentalFile.value = null;
+    instrumentalFileName.value = '';
+    instrumentalFilePath.value = '';
+    duration.value = 0;
+    waveformPeaks.value = null;
+    rmsEnvelope.value = null;
+    currentTime.value = 0;
+    isPlaying.value = false;
+    playbackRate.value = 1.0;
+    mixMode.value = 'vocal';
+    title.value = '';
+    artist.value = '';
+    rawLyrics.value = '';
+    syncedLyricsSnapshot.value = '';
+    lines.value = [];
+    selectedLineIndex.value = 0;
+    selectedWordId.value = null;
+    undoStack.value = [];
+    projectFilePath.value = null;
+    projectSaveStatus.value = null;
+    projectFileError.value = null;
+    audioError.value = null;
+    lastExportedMp4Path.value = null;
+    lastEncoderUsed.value = null;
+    exportError.value = null;
+    screen.value = 'setup';
+    activeTab.value = 'line-timings';
+  }
+
+  async function loadProjectFile(file: File) {
+    projectFileError.value = null;
+    try {
+      const text = await file.text();
+      await applyValidatedProjectJson(text);
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Invalid KaraoCraft project file: this JSON file is not a valid KaraoCraft project.';
+      projectFileError.value = msg;
+      throw new Error(msg);
     }
   }
 
@@ -677,10 +973,15 @@ export const useProjectStore = defineStore('project', () => {
     systemCaps,
     vocalFile,
     vocalFileName,
+    vocalFilePath,
     isDecodingAudio,
     audioError,
     instrumentalFile,
     instrumentalFileName,
+    instrumentalFilePath,
+    projectFilePath,
+    projectSaveStatus,
+    projectFileError,
     duration,
     waveformPeaks,
     peaksPerSecond,
@@ -714,6 +1015,8 @@ export const useProjectStore = defineStore('project', () => {
     detectSystemCapabilities,
     selectVocalFile,
     selectInstrumentalFile,
+    browseVocalFile,
+    browseInstrumentalFile,
     setMixMode,
     setPlaybackRate,
     togglePlay,
@@ -736,7 +1039,10 @@ export const useProjectStore = defineStore('project', () => {
     exportAssFile,
     exportLrcFile,
     saveProjectFile,
+    saveProjectFileAs,
+    openProjectFromDialog,
     loadProjectFile,
+    newProject,
     renderMp4Video,
     revealLastMp4InFinder,
   };

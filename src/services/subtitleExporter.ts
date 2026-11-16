@@ -278,3 +278,62 @@ export function triggerBrowserDownload(filename: string, content: string | Blob,
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+
+export interface KaraoCraftProjectData {
+  app?: string;
+  version: number;
+  savedAt?: string;
+  title?: string;
+  artist?: string;
+  rawLyrics: string;
+  vocalFileName?: string;
+  vocalFilePath?: string;
+  instrumentalFileName?: string;
+  instrumentalFilePath?: string;
+  duration?: number;
+  options?: Partial<KaraokeVisualOptions>;
+  lines: AlignedLyricLine[];
+}
+
+export function parseAndValidateProjectJson(rawText: string): KaraoCraftProjectData {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    throw new Error('Invalid JSON file: could not parse JSON syntax.');
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Invalid KaraoCraft project file: root JSON value must be an object.');
+  }
+
+  const data = parsed as Record<string, unknown>;
+  const hasValidVersion = typeof data.version === 'number' && data.version >= 1;
+  const hasValidApp = data.app === undefined || data.app === 'KaraoCraft';
+  const hasRawLyrics = typeof data.rawLyrics === 'string';
+  const hasLines = Array.isArray(data.lines) && data.lines.length > 0;
+  const hasOptions = data.options !== null && typeof data.options === 'object' && !Array.isArray(data.options);
+
+  if (!hasValidVersion || !hasValidApp || !hasRawLyrics || !hasLines || !hasOptions) {
+    throw new Error(
+      'Invalid KaraoCraft project file: this JSON file is not a valid KaraoCraft project.'
+    );
+  }
+
+  for (const item of data.lines as unknown[]) {
+    if (!item || typeof item !== 'object') {
+      throw new Error('Invalid KaraoCraft project file: malformed lyric line entry.');
+    }
+    const line = item as Record<string, unknown>;
+    if (
+      typeof line.text !== 'string' ||
+      typeof line.startSec !== 'number' ||
+      typeof line.endSec !== 'number' ||
+      !Array.isArray(line.words)
+    ) {
+      throw new Error('Invalid KaraoCraft project file: lyric lines are missing timing or word data.');
+    }
+  }
+
+  return data as unknown as KaraoCraftProjectData;
+}

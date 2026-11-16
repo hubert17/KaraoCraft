@@ -6,6 +6,13 @@ import { RefreshCw, Eraser, Upload } from '@lucide/vue';
 const project = useProjectStore();
 const vocalInputRef = ref<HTMLInputElement | null>(null);
 
+async function handleBrowseVocal() {
+  const handledNatively = await project.browseVocalFile();
+  if (!handledNatively) {
+    vocalInputRef.value?.click();
+  }
+}
+
 async function onVocalChange(e: Event) {
   const input = e.target as HTMLInputElement;
   const file = input.files?.[0];
@@ -67,9 +74,17 @@ async function onVocalChange(e: Event) {
 
       <!-- Vocal Stem Source Row -->
       <div class="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
-        <div class="text-base text-slate-700">
-          <span class="font-semibold text-slate-900">Vocal Stem:</span>
-          <span class="ml-2">{{ project.vocalFileName || 'No audio file loaded' }}</span>
+        <div class="text-base text-slate-700 min-w-0 flex-1">
+          <div>
+            <span class="font-semibold text-slate-900">Vocal Stem:</span>
+            <span class="ml-2">{{ project.vocalFileName || 'No audio file loaded' }}</span>
+          </div>
+          <div v-if="project.vocalFilePath" class="text-xs text-slate-500 font-mono truncate mt-0.5" :title="project.vocalFilePath">
+            Path: {{ project.vocalFilePath }}
+          </div>
+          <div v-if="project.audioError" class="text-xs font-medium text-red-600 mt-1">
+            {{ project.audioError }}
+          </div>
         </div>
         <div>
           <input
@@ -81,7 +96,7 @@ async function onVocalChange(e: Event) {
           />
           <button
             type="button"
-            @click="vocalInputRef?.click()"
+            @click="handleBrowseVocal"
             class="inline-flex items-center gap-1.5 bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 font-semibold text-sm px-3.5 py-2 rounded-lg transition-colors"
           >
             <Upload class="w-4 h-4" />

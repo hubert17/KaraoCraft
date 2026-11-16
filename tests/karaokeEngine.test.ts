@@ -15,6 +15,7 @@ import {
   generateAssSubtitle,
   generateEnhancedLrc,
   hexToAssColor,
+  parseAndValidateProjectJson,
 } from '../src/services/subtitleExporter.ts';
 
 const LF = String.fromCharCode(10);
@@ -131,6 +132,43 @@ describe('KaraoCraft Alignment & Subtitle Engine', () => {
     assert.equal(aligned[0].words[0].startSec, 15.12);
     assert.equal(aligned[1].startSec, 19.08);
     assert.equal(aligned[1].endSec, 22.04);
+  });
+
+  it('validates KaraoCraft project JSON and rejects non-KaraoCraft JSON files', () => {
+    const validJson = JSON.stringify({
+      app: 'KaraoCraft',
+      version: 2,
+      title: 'Second Love',
+      artist: 'Takao Kisugi',
+      rawLyrics: 'Koi mo nidome nara',
+      vocalFileName: 'vocals.wav',
+      vocalFilePath: '/Volumes/GABSMAC4/Media/UVR/vocals.wav',
+      options: { aspectRatio: '4:3' },
+      lines: [
+        {
+          id: 'line-0',
+          text: 'Koi mo nidome nara',
+          startSec: 15.12,
+          endSec: 17.96,
+          stanzaBreakBefore: false,
+          frameIndex: 0,
+          words: [{ id: 'word-0-0', text: 'Koi', startSec: 15.12, endSec: 15.58 }],
+        },
+      ],
+    });
+
+    const parsed = parseAndValidateProjectJson(validJson);
+    assert.equal(parsed.title, 'Second Love');
+    assert.equal(parsed.vocalFilePath, '/Volumes/GABSMAC4/Media/UVR/vocals.wav');
+
+    // Reject arbitrary package.json or unrelated JSON
+    assert.throws(
+      () => parseAndValidateProjectJson(JSON.stringify({ name: 'some-app', version: '1.0.0' })),
+      /not a valid KaraoCraft project/
+    );
+
+    // Reject malformed JSON syntax
+    assert.throws(() => parseAndValidateProjectJson('{bad json'), /Invalid JSON file/);
   });
 
   it('generates valid ASS karaoke script and renders cleanly through FFmpeg libass', () => {

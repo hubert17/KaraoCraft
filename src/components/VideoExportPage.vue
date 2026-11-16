@@ -38,6 +38,13 @@ function formatClock(sec: number): string {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+async function handleBrowseInstrumental() {
+  const handledNatively = await project.browseInstrumentalFile();
+  if (!handledNatively) {
+    instInputRef.value?.click();
+  }
+}
+
 function onInstSelect(e: Event) {
   const input = e.target as HTMLInputElement;
   const file = input.files?.[0];
@@ -159,6 +166,13 @@ function onInstSelect(e: Event) {
               <div class="text-base font-semibold text-slate-900 truncate">
                 {{ project.instrumentalFileName }}
               </div>
+              <div
+                v-if="project.instrumentalFilePath"
+                class="text-xs text-emerald-800/80 font-mono truncate mt-0.5"
+                :title="project.instrumentalFilePath"
+              >
+                {{ project.instrumentalFilePath }}
+              </div>
             </div>
             <button
               type="button"
@@ -172,7 +186,7 @@ function onInstSelect(e: Event) {
 
           <button
             type="button"
-            @click="instInputRef?.click()"
+            @click="handleBrowseInstrumental"
             class="w-full inline-flex items-center justify-center gap-2 rounded-xl border-2 border-dashed border-purple-300 bg-purple-50/50 hover:bg-purple-50 text-brand-purple font-semibold text-base py-3 px-4 transition-colors cursor-pointer"
           >
             <Upload class="w-5 h-5" />

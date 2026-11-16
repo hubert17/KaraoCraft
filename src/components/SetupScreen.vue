@@ -14,6 +14,13 @@ function formatDuration(sec: number): string {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+async function handleBrowseVocal() {
+  const handledNatively = await project.browseVocalFile();
+  if (!handledNatively) {
+    fileInputRef.value?.click();
+  }
+}
+
 async function handleFileSelect(e: Event) {
   const input = e.target as HTMLInputElement;
   const file = input.files?.[0];
@@ -96,13 +103,20 @@ function loadSampleLyrics() {
                 <div class="font-bold text-lg text-slate-900 break-words px-2">
                   {{ project.vocalFileName }}
                 </div>
+                <div
+                  v-if="project.vocalFilePath"
+                  class="text-xs text-slate-500 font-mono truncate px-3"
+                  :title="project.vocalFilePath"
+                >
+                  {{ project.vocalFilePath }}
+                </div>
                 <div class="text-base text-slate-600 font-medium">
                   Duration: {{ formatDuration(project.duration) }}
                 </div>
                 <div class="pt-1">
                   <button
                     type="button"
-                    @click="fileInputRef?.click()"
+                    @click="handleBrowseVocal"
                     class="bg-brand-purple hover:bg-brand-purpleHover text-white font-semibold text-base px-6 py-2.5 rounded-xl shadow-sm transition-colors"
                   >
                     Change File
@@ -114,7 +128,7 @@ function loadSampleLyrics() {
               <div v-else class="space-y-4">
                 <button
                   type="button"
-                  @click="fileInputRef?.click()"
+                  @click="handleBrowseVocal"
                   class="bg-brand-purple hover:bg-brand-purpleHover text-white font-semibold text-lg px-9 py-3 rounded-xl shadow-sm transition-colors cursor-pointer"
                 >
                   Browse

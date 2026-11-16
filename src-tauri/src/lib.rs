@@ -52,6 +52,51 @@ pub struct RenderMp4Response {
     pub encoder_used: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenedProjectFile {
+    pub file_path: String,
+    pub content: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalAudioFilePayload {
+    pub file_path: String,
+    pub file_name: String,
+    pub base64_data: String,
+    pub mime_type: String,
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity((input.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i + 3 <= input.len() {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
+        out.push(TABLE[((n >> 18) & 0x3f) as usize]);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize]);
+        out.push(TABLE[((n >> 6) & 0x3f) as usize]);
+        out.push(TABLE[(n & 0x3f) as usize]);
+        i += 3;
+    }
+    let rem = input.len() - i;
+    if rem == 1 {
+        let n = (input[i] as u32) << 16;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize]);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize]);
+        out.push(b'=');
+        out.push(b'=');
+    } else if rem == 2 {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+        out.push(TABLE[((n >> 18) & 0x3f) as usize]);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize]);
+        out.push(TABLE[((n >> 6) & 0x3f) as usize]);
+        out.push(b'=');
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
 fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     let mut table = [255u8; 256];
     for (i, &b) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -711,6 +756,309 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
     Ok(())
 }
 
+fn find_audio_path_on_disk(file_name: &str, file_size: Option<u64>) -> Option<PathBuf> {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = env::var("HOME") {
+        let home_pb = PathBuf::from(&home);
+        for sub in ["Downloads", "Music", "Desktop", "Documents"] {
+            let p = home_pb.join(sub).join(trimmed);
+            if p.is_file() {
+                candidates.push(p);
+            }
+        }
+    }
+
+    let escaped = trimmed.replace('\'', "\\'");
+    let query = format!("kMDItemFSName == '{}'", escaped);
+    if let Ok(out) = Command::new("mdfind").arg(&query).output() {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let p = PathBuf::from(line.trim());
+                if p.is_file() && !candidates.contains(&p) {
+                    candidates.push(p);
+                }
+            }
+        }
+    }
+
+    if let Some(target_size) = file_size {
+        for c in &candidates {
+            if let Ok(meta) = fs::metadata(c) {
+                if meta.len() == target_size {
+                    return Some(c.clone());
+                }
+            }
+        }
+    }
+
+    candidates.into_iter().next()
+}
+
+fn infer_audio_mime(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "wav" => "audio/wav".to_string(),
+        "mp3" => "audio/mpeg".to_string(),
+        "m4a" | "aac" => "audio/mp4".to_string(),
+        "flac" => "audio/flac".to_string(),
+        "ogg" | "opus" => "audio/ogg".to_string(),
+        "mp4" => "video/mp4".to_string(),
+        _ => "audio/mpeg".to_string(),
+    }
+}
+
+#[tauri::command]
+fn resolve_local_audio_path(file_name: String, file_size: Option<u64>) -> Option<String> {
+    find_audio_path_on_disk(&file_name, file_size).map(|p| p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn read_local_audio_file(
+    file_path: Option<String>,
+    file_name: Option<String>,
+) -> Result<LocalAudioFilePayload, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut resolved: Option<PathBuf> = None;
+
+        if let Some(ref fp) = file_path {
+            let p = PathBuf::from(fp.trim());
+            if p.is_file() {
+                resolved = Some(p);
+            }
+        }
+
+        if resolved.is_none() {
+            if let Some(ref fnm) = file_name {
+                resolved = find_audio_path_on_disk(fnm, None);
+            } else if let Some(ref fp) = file_path {
+                if let Some(base) = Path::new(fp).file_name().and_then(|s| s.to_str()) {
+                    resolved = find_audio_path_on_disk(base, None);
+                }
+            }
+        }
+
+        let Some(target_path) = resolved else {
+            let label = file_path
+                .or(file_name)
+                .unwrap_or_else(|| "audio file".to_string());
+            return Err(format!("Audio file not found at: {}", label));
+        };
+
+        let bytes = fs::read(&target_path)
+            .map_err(|e| format!("Could not read audio file '{}': {}", target_path.display(), e))?;
+        let name = target_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("vocal.wav")
+            .to_string();
+        let mime_type = infer_audio_mime(&target_path);
+
+        Ok(LocalAudioFilePayload {
+            file_path: target_path.to_string_lossy().to_string(),
+            file_name: name,
+            base64_data: encode_base64(&bytes),
+            mime_type,
+        })
+    })
+    .await
+    .map_err(|e| format!("Read audio task panicked: {}", e))?
+}
+
+fn resolve_dialog_dir(primary: Option<&str>, fallback: Option<&str>) -> PathBuf {
+    for candidate in [primary, fallback].into_iter().flatten() {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let p = Path::new(trimmed);
+        if p.is_dir() {
+            return p.to_path_buf();
+        }
+        if let Some(parent) = p.parent() {
+            if parent.is_dir() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Downloads"))
+        .filter(|d| d.is_dir())
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+#[tauri::command]
+async fn open_audio_dialog(
+    prompt: Option<String>,
+    initial_dir: Option<String>,
+) -> Result<Option<LocalAudioFilePayload>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let start_dir = resolve_dialog_dir(initial_dir.as_deref(), None);
+        let title = prompt.unwrap_or_else(|| "Select Audio File".to_string());
+
+        let script = r#"
+            on run argv
+                set dlgPrompt to item 1 of argv
+                set defDir to POSIX file (item 2 of argv)
+                try
+                    set chosenFile to choose file with prompt dlgPrompt of type {"public.audio", "public.movie", "wav", "mp3", "m4a", "flac", "aac", "ogg", "opus", "mp4"} default location defDir
+                    return POSIX path of chosenFile
+                on error number -128
+                    return ""
+                end try
+            end run
+        "#;
+
+        let out = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(&title)
+            .arg(start_dir.to_string_lossy().to_string())
+            .output()
+            .map_err(|e| format!("Failed to open audio file dialog: {}", e))?;
+
+        let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+
+        let target_path = PathBuf::from(&chosen);
+        let bytes = fs::read(&target_path).map_err(|e| {
+            format!(
+                "Could not read audio file '{}': {}",
+                target_path.display(),
+                e
+            )
+        })?;
+        let name = target_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("audio.wav")
+            .to_string();
+        let mime_type = infer_audio_mime(&target_path);
+
+        Ok(Some(LocalAudioFilePayload {
+            file_path: chosen,
+            file_name: name,
+            base64_data: encode_base64(&bytes),
+            mime_type,
+        }))
+    })
+    .await
+    .map_err(|e| format!("Open audio dialog task panicked: {}", e))?
+}
+
+#[tauri::command]
+async fn open_project_dialog(
+    initial_dir: Option<String>,
+) -> Result<Option<OpenedProjectFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let start_dir = resolve_dialog_dir(initial_dir.as_deref(), None);
+        let script = r#"
+            on run argv
+                set defDir to POSIX file (item 1 of argv)
+                try
+                    set chosenFile to choose file with prompt "Open KaraoCraft Project (.json)" of type {"json", "public.json"} default location defDir
+                    return POSIX path of chosenFile
+                on error number -128
+                    return ""
+                end try
+            end run
+        "#;
+        let out = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(start_dir.to_string_lossy().to_string())
+            .output()
+            .map_err(|e| format!("Failed to open file dialog: {}", e))?;
+
+        let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&chosen)
+            .map_err(|e| format!("Could not read project file '{}': {}", chosen, e))?;
+
+        Ok(Some(OpenedProjectFile {
+            file_path: chosen,
+            content,
+        }))
+    })
+    .await
+    .map_err(|e| format!("Open project dialog task panicked: {}", e))?
+}
+
+#[tauri::command]
+async fn save_project_dialog(
+    default_name: String,
+    current_path: Option<String>,
+    initial_dir: Option<String>,
+    content: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let start_dir = resolve_dialog_dir(current_path.as_deref(), initial_dir.as_deref());
+
+        let script = r#"
+            on run argv
+                set defName to item 1 of argv
+                set defDir to POSIX file (item 2 of argv)
+                try
+                    set chosenFile to choose file name with prompt "Save KaraoCraft Project (.json)" default name defName default location defDir
+                    return POSIX path of chosenFile
+                on error number -128
+                    return ""
+                end try
+            end run
+        "#;
+
+        let out = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(&default_name)
+            .arg(start_dir.to_string_lossy().to_string())
+            .output()
+            .map_err(|e| format!("Failed to open save dialog: {}", e))?;
+
+        let mut chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+
+        if !chosen.to_lowercase().ends_with(".json") {
+            chosen.push_str(".json");
+        }
+
+        fs::write(&chosen, content.as_bytes())
+            .map_err(|e| format!("Failed to save project file '{}': {}", chosen, e))?;
+
+        Ok(Some(chosen))
+    })
+    .await
+    .map_err(|e| format!("Save project dialog task panicked: {}", e))?
+}
+
+#[tauri::command]
+fn write_project_file(file_path: String, content: String) -> Result<String, String> {
+    let trimmed = file_path.trim();
+    if trimmed.is_empty() {
+        return Err("Project file path is empty.".to_string());
+    }
+    fs::write(trimmed, content.as_bytes())
+        .map_err(|e| format!("Failed to save project file '{}': {}", trimmed, e))?;
+    Ok(trimmed.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -719,7 +1067,13 @@ pub fn run() {
             check_system_capabilities,
             transcribe_whisper_words,
             render_karaoke_mp4,
-            reveal_in_finder
+            reveal_in_finder,
+            resolve_local_audio_path,
+            read_local_audio_file,
+            open_audio_dialog,
+            open_project_dialog,
+            save_project_dialog,
+            write_project_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

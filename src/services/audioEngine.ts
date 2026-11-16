@@ -14,34 +14,34 @@ export type AudioMixMode = 'vocal' | 'instrumental' | 'mix';
 type TimeListener = (currentTimeSec: number, isPlaying: boolean) => void;
 
 class KaraokeAudioEngine {
-  private vocalAudio: HTMLAudioElement;
-  private instrumentalAudio: HTMLAudioElement;
-  private vocalUrl: string | null = null;
-  private instrumentalUrl: string | null = null;
+  private ctx: AudioContext | null = null;
+  private vocalBuffer: AudioBuffer | null = null;
+  private instrumentalBuffer: AudioBuffer | null = null;
+  private vocalSource: AudioBufferSourceNode | null = null;
+  private instrumentalSource: AudioBufferSourceNode | null = null;
+  private vocalGain: GainNode | null = null;
+  private instrumentalGain: GainNode | null = null;
+
   private mixMode: AudioMixMode = 'vocal';
   private playbackRate = 1.0;
   private rafId: number | null = null;
   private listeners = new Set<TimeListener>();
   private hasInstrumental = false;
 
-  constructor() {
-    this.vocalAudio = new Audio();
-    this.vocalAudio.preload = 'auto';
+  private playing = false;
+  private anchorOffsetSec = 0;
+  private anchorCtxTime = 0;
+  private durationSec = 0;
+  private instLoadToken = 0;
 
-    this.instrumentalAudio = new Audio();
-    this.instrumentalAudio.preload = 'auto';
-
-    this.vocalAudio.addEventListener('ended', () => {
-      this.pause();
-      this.emit();
-    });
-
-    this.instrumentalAudio.addEventListener('ended', () => {
-      if (this.mixMode === 'instrumental') {
-        this.pause();
-        this.emit();
-      }
-    });
+  private ensureContext(): AudioContext {
+    if (!this.ctx) {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.ctx = new AudioCtx();
+    }
+    return this.ctx;
   }
 
   subscribe(listener: TimeListener): () => void {
@@ -52,33 +52,24 @@ class KaraokeAudioEngine {
   }
 
   private emit() {
-    const primary = this.getPrimaryElement();
-    const playing = !primary.paused && !primary.ended;
-    const t = primary.currentTime || 0;
+    const t = this.getCurrentTime();
     for (const listener of this.listeners) {
-      listener(t, playing);
+      listener(t, this.playing);
     }
-  }
-
-  private getPrimaryElement(): HTMLAudioElement {
-    if (this.mixMode === 'instrumental' && this.hasInstrumental) {
-      return this.instrumentalAudio;
-    }
-    return this.vocalAudio;
   }
 
   private startSyncLoop() {
     this.stopSyncLoop();
     const tick = () => {
-      if (this.mixMode === 'mix' && this.hasInstrumental && !this.vocalAudio.paused) {
-        const drift = Math.abs(this.instrumentalAudio.currentTime - this.vocalAudio.currentTime);
-        if (drift > 0.04) {
-          this.instrumentalAudio.currentTime = this.vocalAudio.currentTime;
-        }
+      const cur = this.getCurrentTime();
+      if (this.durationSec > 0 && cur >= this.durationSec) {
+        this.pause();
+        this.anchorOffsetSec = this.durationSec;
+        this.emit();
+        return;
       }
       this.emit();
-      const primary = this.getPrimaryElement();
-      if (!primary.paused && !primary.ended) {
+      if (this.playing) {
         this.rafId = requestAnimationFrame(tick);
       } else {
         this.rafId = null;
@@ -94,91 +85,121 @@ class KaraokeAudioEngine {
     }
   }
 
-  async loadVocalFile(file: File): Promise<DecodedVocalData> {
-    this.pause();
-    if (this.vocalUrl) {
-      URL.revokeObjectURL(this.vocalUrl);
+  private stopSources() {
+    if (this.vocalSource) {
+      try {
+        this.vocalSource.onended = null;
+        this.vocalSource.stop();
+        this.vocalSource.disconnect();
+      } catch {
+        // Ignore already stopped
+      }
+      this.vocalSource = null;
     }
-    this.vocalUrl = URL.createObjectURL(file);
-    this.vocalAudio.src = this.vocalUrl;
-    this.vocalAudio.playbackRate = this.playbackRate;
-    this.vocalAudio.load();
-    this.applyVolumes();
-
-    const arrayBuffer = await file.arrayBuffer();
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const ctx = new AudioCtx();
-    try {
-      const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
-      return this.extractWaveformAndEnvelope(audioBuffer);
-    } finally {
-      await ctx.close().catch(() => undefined);
+    if (this.instrumentalSource) {
+      try {
+        this.instrumentalSource.onended = null;
+        this.instrumentalSource.stop();
+        this.instrumentalSource.disconnect();
+      } catch {
+        // Ignore already stopped
+      }
+      this.instrumentalSource = null;
     }
   }
 
+  async loadVocalFile(file: File): Promise<DecodedVocalData> {
+    this.pause();
+    this.anchorOffsetSec = 0;
+
+    const arrayBuffer = await file.arrayBuffer();
+    const ctx = this.ensureContext();
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+    this.vocalBuffer = audioBuffer;
+    this.durationSec = audioBuffer.duration;
+    this.emit();
+    return this.extractWaveformAndEnvelope(audioBuffer);
+  }
+
   loadInstrumentalFile(file: File | null) {
-    const wasPlaying = this.isPlaying();
+    const wasPlaying = this.playing;
     const currentT = this.getCurrentTime();
     this.pause();
-
-    if (this.instrumentalUrl) {
-      URL.revokeObjectURL(this.instrumentalUrl);
-      this.instrumentalUrl = null;
-    }
+    this.instLoadToken++;
+    const token = this.instLoadToken;
 
     if (!file) {
       this.hasInstrumental = false;
-      this.instrumentalAudio.removeAttribute('src');
+      this.instrumentalBuffer = null;
       if (this.mixMode !== 'vocal') {
         this.mixMode = 'vocal';
       }
       this.applyVolumes();
+      this.emit();
       return;
     }
 
-    this.instrumentalUrl = URL.createObjectURL(file);
-    this.instrumentalAudio.src = this.instrumentalUrl;
-    this.instrumentalAudio.playbackRate = this.playbackRate;
-    this.instrumentalAudio.currentTime = currentT;
-    this.instrumentalAudio.load();
     this.hasInstrumental = true;
-    this.applyVolumes();
+    const ctx = this.ensureContext();
+    void file
+      .arrayBuffer()
+      .then((buf) => ctx.decodeAudioData(buf.slice(0)))
+      .then((decoded) => {
+        if (token !== this.instLoadToken) return;
+        this.instrumentalBuffer = decoded;
+        if (!this.durationSec) {
+          this.durationSec = decoded.duration;
+        }
+        this.applyVolumes();
+        if (wasPlaying) {
+          this.anchorOffsetSec = currentT;
+          void this.play();
+        }
+      })
+      .catch(() => {
+        if (token !== this.instLoadToken) return;
+        this.hasInstrumental = false;
+        this.instrumentalBuffer = null;
+      });
+  }
 
-    if (wasPlaying) {
-      void this.play();
+  reset() {
+    this.pause();
+    this.instLoadToken++;
+    this.vocalBuffer = null;
+    this.instrumentalBuffer = null;
+    this.hasInstrumental = false;
+    this.mixMode = 'vocal';
+    this.playbackRate = 1.0;
+    this.anchorOffsetSec = 0;
+    this.durationSec = 0;
+    this.emit();
+  }
+
+  private getGainTargets(): { vocal: number; instrumental: number } {
+    if (!this.hasInstrumental || !this.instrumentalBuffer || this.mixMode === 'vocal') {
+      return { vocal: 1.0, instrumental: 0.0 };
     }
+    if (this.mixMode === 'instrumental') {
+      return { vocal: 0.0, instrumental: 1.0 };
+    }
+    // Guide mix: full instrumental + softer guide vocal
+    return { vocal: 0.45, instrumental: 1.0 };
   }
 
   private applyVolumes() {
-    if (!this.hasInstrumental || this.mixMode === 'vocal') {
-      this.vocalAudio.muted = false;
-      this.vocalAudio.volume = 1.0;
-      this.instrumentalAudio.muted = true;
-      this.instrumentalAudio.volume = 0.0;
-    } else if (this.mixMode === 'instrumental') {
-      this.vocalAudio.muted = true;
-      this.vocalAudio.volume = 0.0;
-      this.instrumentalAudio.muted = false;
-      this.instrumentalAudio.volume = 1.0;
-    } else {
-      // Guide mix: full instrumental + softer guide vocal
-      this.vocalAudio.muted = false;
-      this.vocalAudio.volume = 0.45;
-      this.instrumentalAudio.muted = false;
-      this.instrumentalAudio.volume = 1.0;
+    const { vocal, instrumental } = this.getGainTargets();
+    if (this.vocalGain) {
+      this.vocalGain.gain.value = vocal;
+    }
+    if (this.instrumentalGain) {
+      this.instrumentalGain.gain.value = instrumental;
     }
   }
 
   setMixMode(mode: AudioMixMode) {
-    const currentT = this.getCurrentTime();
-    const wasPlaying = this.isPlaying();
-    this.pause();
     this.mixMode = this.hasInstrumental ? mode : 'vocal';
     this.applyVolumes();
-    this.seek(currentT);
-    if (wasPlaying) {
-      void this.play();
-    }
   }
 
   getMixMode(): AudioMixMode {
@@ -187,9 +208,17 @@ class KaraokeAudioEngine {
 
   setPlaybackRate(rate: number) {
     const clamped = Math.max(0.5, Math.min(1.5, rate));
+    if (this.playing) {
+      this.anchorOffsetSec = this.getCurrentTime();
+      this.anchorCtxTime = this.ensureContext().currentTime;
+    }
     this.playbackRate = clamped;
-    this.vocalAudio.playbackRate = clamped;
-    this.instrumentalAudio.playbackRate = clamped;
+    if (this.vocalSource) {
+      this.vocalSource.playbackRate.value = clamped;
+    }
+    if (this.instrumentalSource) {
+      this.instrumentalSource.playbackRate.value = clamped;
+    }
   }
 
   getPlaybackRate(): number {
@@ -197,43 +226,74 @@ class KaraokeAudioEngine {
   }
 
   isPlaying(): boolean {
-    const primary = this.getPrimaryElement();
-    return !primary.paused && !primary.ended;
+    return this.playing;
   }
 
   getCurrentTime(): number {
-    return this.getPrimaryElement().currentTime || 0;
+    if (!this.playing || !this.ctx) {
+      return this.anchorOffsetSec;
+    }
+    const elapsed = (this.ctx.currentTime - this.anchorCtxTime) * this.playbackRate;
+    const t = this.anchorOffsetSec + elapsed;
+    return this.durationSec > 0 ? Math.min(this.durationSec, Math.max(0, t)) : Math.max(0, t);
   }
 
   async play() {
-    if (!this.vocalUrl) return;
-    this.applyVolumes();
-    const t = this.getCurrentTime();
-
-    if (this.mixMode === 'instrumental' && this.hasInstrumental) {
-      this.instrumentalAudio.currentTime = t;
-      await this.instrumentalAudio.play().catch(() => undefined);
-    } else if (this.mixMode === 'mix' && this.hasInstrumental) {
-      this.vocalAudio.currentTime = t;
-      this.instrumentalAudio.currentTime = t;
-      await Promise.all([
-        this.vocalAudio.play().catch(() => undefined),
-        this.instrumentalAudio.play().catch(() => undefined),
-      ]);
-    } else {
-      this.vocalAudio.currentTime = t;
-      await this.vocalAudio.play().catch(() => undefined);
+    if (!this.vocalBuffer && !this.instrumentalBuffer) return;
+    const ctx = this.ensureContext();
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
     }
 
+    this.stopSources();
+
+    if (this.durationSec > 0 && this.anchorOffsetSec >= this.durationSec - 0.02) {
+      this.anchorOffsetSec = 0;
+    }
+
+    const offset = Math.max(0, this.anchorOffsetSec);
+    const { vocal, instrumental } = this.getGainTargets();
+
+    if (this.vocalBuffer && offset < this.vocalBuffer.duration) {
+      const vGain = ctx.createGain();
+      vGain.gain.value = vocal;
+      vGain.connect(ctx.destination);
+      this.vocalGain = vGain;
+
+      const vSrc = ctx.createBufferSource();
+      vSrc.buffer = this.vocalBuffer;
+      vSrc.playbackRate.value = this.playbackRate;
+      vSrc.connect(vGain);
+      vSrc.start(0, offset);
+      this.vocalSource = vSrc;
+    }
+
+    if (this.instrumentalBuffer && offset < this.instrumentalBuffer.duration) {
+      const iGain = ctx.createGain();
+      iGain.gain.value = instrumental;
+      iGain.connect(ctx.destination);
+      this.instrumentalGain = iGain;
+
+      const iSrc = ctx.createBufferSource();
+      iSrc.buffer = this.instrumentalBuffer;
+      iSrc.playbackRate.value = this.playbackRate;
+      iSrc.connect(iGain);
+      iSrc.start(0, offset);
+      this.instrumentalSource = iSrc;
+    }
+
+    this.anchorCtxTime = ctx.currentTime;
+    this.playing = true;
     this.startSyncLoop();
     this.emit();
   }
 
   pause() {
-    this.vocalAudio.pause();
-    if (this.hasInstrumental) {
-      this.instrumentalAudio.pause();
+    if (this.playing) {
+      this.anchorOffsetSec = this.getCurrentTime();
     }
+    this.playing = false;
+    this.stopSources();
     this.stopSyncLoop();
     this.emit();
   }
@@ -247,15 +307,18 @@ class KaraokeAudioEngine {
   }
 
   seek(timeSec: number) {
-    const duration = this.vocalAudio.duration || 0;
+    const duration = this.durationSec || 0;
     const clamped = Math.max(0, duration > 0 ? Math.min(duration, timeSec) : timeSec);
-    if (this.vocalUrl) {
-      this.vocalAudio.currentTime = clamped;
+    const wasPlaying = this.playing;
+    if (wasPlaying) {
+      this.stopSources();
+      this.playing = false;
     }
-    if (this.hasInstrumental && this.instrumentalUrl) {
-      this.instrumentalAudio.currentTime = clamped;
-    }
+    this.anchorOffsetSec = clamped;
     this.emit();
+    if (wasPlaying) {
+      void this.play();
+    }
   }
 
   private extractWaveformAndEnvelope(buffer: AudioBuffer): DecodedVocalData {
@@ -353,4 +416,14 @@ export function fileToBase64(file: File): Promise<string> {
     reader.onerror = () => reject(new Error('Failed to read audio file'));
     reader.readAsDataURL(file);
   });
+}
+
+export function base64ToFile(base64: string, fileName: string, mimeType = 'audio/wav'): File {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new File([bytes], fileName, { type: mimeType });
 }

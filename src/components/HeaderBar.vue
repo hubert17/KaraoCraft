@@ -1,14 +1,33 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, onMounted, onBeforeUnmount } from 'vue';
 import { useProjectStore } from '../stores/projectStore';
-import { FolderOpen, Save, HelpCircle, ArrowLeft } from '@lucide/vue';
+import {
+  FilePlus2,
+  FolderOpen,
+  Save,
+  HelpCircle,
+  ArrowLeft,
+  ChevronDown,
+  Check,
+  AlertCircle,
+  X,
+} from '@lucide/vue';
 
 const project = useProjectStore();
 const loadInputRef = ref<HTMLInputElement | null>(null);
+const showSaveMenu = ref(false);
+const saveSplitRef = ref<HTMLElement | null>(null);
 
 function handleBackToSetup() {
   project.pauseAudio();
   project.screen = 'setup';
+}
+
+async function handleOpenClick() {
+  const handledNatively = await project.openProjectFromDialog();
+  if (!handledNatively) {
+    loadInputRef.value?.click();
+  }
 }
 
 async function onProjectFileChange(e: Event) {
@@ -18,16 +37,55 @@ async function onProjectFileChange(e: Event) {
   try {
     await project.loadProjectFile(file);
   } catch {
-    alert('Could not read .karaocraft.json project file.');
+    // Error is already stored in project.projectFileError and displayed in the banner
   } finally {
     input.value = '';
   }
 }
+
+async function handlePrimarySave() {
+  showSaveMenu.value = false;
+  await project.saveProjectFile();
+}
+
+async function handleSaveAs() {
+  showSaveMenu.value = false;
+  await project.saveProjectFileAs();
+}
+
+function handleDocumentClick(e: MouseEvent) {
+  if (!showSaveMenu.value) return;
+  if (saveSplitRef.value && !saveSplitRef.value.contains(e.target as Node)) {
+    showSaveMenu.value = false;
+  }
+}
+
+function handleKeyDown(e: KeyboardEvent) {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+    if (project.screen !== 'editor') return;
+    e.preventDefault();
+    if (e.shiftKey) {
+      handleSaveAs();
+    } else {
+      handlePrimarySave();
+    }
+  }
+}
+
+onMounted(() => {
+  document.addEventListener('mousedown', handleDocumentClick);
+  window.addEventListener('keydown', handleKeyDown);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener('mousedown', handleDocumentClick);
+  window.removeEventListener('keydown', handleKeyDown);
+});
 </script>
 
 <template>
   <header
-    class="w-full bg-white border-b border-slate-200 select-none shrink-0 titlebar-drag"
+    class="w-full bg-white border-b border-slate-200 select-none shrink-0 titlebar-drag relative"
     :class="project.screen === 'setup' ? 'pt-7 pb-3 px-8' : 'pt-6 pb-2.5 px-6'"
   >
     <input
@@ -60,11 +118,21 @@ async function onProjectFileChange(e: Event) {
         </button>
         <button
           type="button"
-          @click="loadInputRef?.click()"
-          class="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl px-3.5 py-2 text-sm font-semibold shadow-sm transition-colors"
+          @click="project.newProject()"
+          title="New Project (Clear Everything)"
+          aria-label="New Project"
+          class="inline-flex items-center justify-center bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl p-2 shadow-sm transition-colors"
+        >
+          <FilePlus2 class="w-4 h-4" />
+        </button>
+        <button
+          type="button"
+          @click="handleOpenClick"
+          title="Open Project (.json)"
+          aria-label="Open Project"
+          class="inline-flex items-center justify-center bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl p-2 shadow-sm transition-colors"
         >
           <FolderOpen class="w-4 h-4" />
-          <span>Open Project</span>
         </button>
       </div>
     </div>
@@ -105,21 +173,96 @@ async function onProjectFileChange(e: Event) {
         </button>
         <button
           type="button"
-          @click="loadInputRef?.click()"
-          class="inline-flex items-center gap-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-lg px-3 py-1.5 text-sm font-semibold transition-colors"
+          @click="project.newProject()"
+          title="New Project (Clear Everything)"
+          aria-label="New Project"
+          class="inline-flex items-center justify-center bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-lg p-1.5 transition-colors"
         >
-          <FolderOpen class="w-4 h-4" />
-          <span>Open</span>
+          <FilePlus2 class="w-4 h-4" />
         </button>
         <button
           type="button"
-          @click="project.saveProjectFile()"
-          class="inline-flex items-center gap-1.5 bg-brand-purple hover:bg-brand-purpleHover text-white rounded-lg px-3.5 py-1.5 text-sm font-semibold shadow-sm transition-colors"
+          @click="handleOpenClick"
+          title="Open Project (.json)"
+          aria-label="Open Project"
+          class="inline-flex items-center justify-center bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-lg p-1.5 transition-colors"
         >
-          <Save class="w-4 h-4" />
-          <span>Save Project</span>
+          <FolderOpen class="w-4 h-4" />
         </button>
+
+        <!-- Split Save / Save As Button -->
+        <div ref="saveSplitRef" class="relative inline-flex items-stretch shadow-sm rounded-lg">
+          <button
+            type="button"
+            @click="handlePrimarySave"
+            :title="
+              project.projectFilePath
+                ? `Save to ${project.projectFilePath} (⌘S)`
+                : 'Save Project (⌘S)'
+            "
+            class="inline-flex items-center gap-1.5 bg-brand-purple hover:bg-brand-purpleHover text-white rounded-l-lg pl-3.5 pr-2.5 py-1.5 text-sm font-semibold transition-colors"
+          >
+            <Check v-if="project.projectSaveStatus" class="w-4 h-4 text-emerald-300" />
+            <Save v-else class="w-4 h-4" />
+            <span>{{ project.projectSaveStatus || 'Save Project' }}</span>
+          </button>
+
+          <button
+            type="button"
+            @click="showSaveMenu = !showSaveMenu"
+            title="More Save Options"
+            aria-label="Save Options Dropdown"
+            class="inline-flex items-center justify-center bg-brand-purple hover:bg-brand-purpleHover text-white border-l border-white/25 rounded-r-lg px-2 py-1.5 text-sm font-semibold transition-colors"
+          >
+            <ChevronDown class="w-4 h-4" />
+          </button>
+
+          <!-- Dropdown Menu -->
+          <div
+            v-if="showSaveMenu"
+            class="absolute right-0 top-full mt-1.5 w-60 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-50 text-left"
+          >
+            <button
+              type="button"
+              @click="handleSaveAs"
+              class="w-full px-3.5 py-2 text-sm font-semibold text-slate-700 hover:bg-purple-50 hover:text-brand-purple flex items-center justify-between transition-colors"
+            >
+              <span class="flex items-center gap-2">
+                <FolderOpen class="w-4 h-4" />
+                <span>Save As…</span>
+              </span>
+              <span class="text-xs text-slate-400 font-mono">⇧⌘S</span>
+            </button>
+
+            <div
+              v-if="project.projectFilePath"
+              class="mt-1 pt-1.5 px-3.5 pb-1 border-t border-slate-100 text-[11px] text-slate-400 truncate"
+              :title="project.projectFilePath"
+            >
+              Path: {{ project.projectFilePath }}
+            </div>
+          </div>
+        </div>
       </div>
+    </div>
+
+    <!-- Invalid Project File Error Banner -->
+    <div
+      v-if="project.projectFileError"
+      class="mt-2.5 max-w-4xl mx-auto bg-red-50 border border-red-200 rounded-xl px-4 py-2.5 flex items-center justify-between gap-3 text-sm text-red-800 titlebar-no-drag"
+    >
+      <div class="flex items-center gap-2 font-medium">
+        <AlertCircle class="w-4 h-4 text-red-600 shrink-0" />
+        <span>{{ project.projectFileError }}</span>
+      </div>
+      <button
+        type="button"
+        @click="project.projectFileError = null"
+        class="text-red-500 hover:text-red-800 p-1 rounded-lg transition-colors"
+        title="Dismiss"
+      >
+        <X class="w-4 h-4" />
+      </button>
     </div>
   </header>
 </template>
