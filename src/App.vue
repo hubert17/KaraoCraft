@@ -10,11 +10,13 @@ import TimingsEditor from './components/TimingsEditor.vue';
 import VideoExportPage from './components/VideoExportPage.vue';
 import UvrGuideModal from './components/UvrGuideModal.vue';
 import ResyncModal from './components/ResyncModal.vue';
+import AboutModal from './components/AboutModal.vue';
+import FirstRunSetupModal from './components/FirstRunSetupModal.vue';
 
 const project = useProjectStore();
 
 onMounted(() => {
-  void project.detectSystemCapabilities();
+  void project.detectSystemCapabilities(true);
 });
 </script>
 
@@ -42,5 +44,7 @@ onMounted(() => {
     <!-- Modals -->
     <UvrGuideModal />
     <ResyncModal />
+    <AboutModal />
+    <FirstRunSetupModal />
   </div>
 </template>

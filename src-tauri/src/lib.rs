@@ -4,6 +4,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Emitter;
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupProgressEvent {
+    pub step: String,
+    pub percent: u8,
+    pub message: String,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -146,15 +155,28 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn app_runtime_dir() -> PathBuf {
+    if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("com.karaocraft.app")
+    } else {
+        env::temp_dir().join("com.karaocraft.app")
+    }
+}
+
 fn search_binary(names: &[&str]) -> Option<(String, PathBuf)> {
+    let runtime_bin = app_runtime_dir().join("bin");
     let mut search_dirs: Vec<PathBuf> = vec![
+        runtime_bin,
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/usr/bin"),
     ];
 
     if let Ok(home) = env::var("HOME") {
-        search_dirs.insert(0, PathBuf::from(&home).join(".local/bin"));
+        search_dirs.insert(1, PathBuf::from(&home).join(".local/bin"));
         search_dirs.push(PathBuf::from(&home).join("Library/Python/3.11/bin"));
         search_dirs.push(PathBuf::from(&home).join("Library/Python/3.12/bin"));
         search_dirs.push(PathBuf::from(&home).join("Library/Python/3.13/bin"));
@@ -219,7 +241,10 @@ fn unique_stamp() -> u128 {
 }
 
 fn find_mms_python() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut candidates: Vec<PathBuf> = vec![
+        app_runtime_dir().join("venv/bin/python"),
+        app_runtime_dir().join("venv/bin/python3"),
+    ];
     if let Ok(home) = env::var("HOME") {
         let home_path = PathBuf::from(&home);
         candidates.push(home_path.join(".local/pipx/venvs/openai-whisper/bin/python"));
@@ -1059,6 +1084,164 @@ fn write_project_file(file_path: String, content: String) -> Result<String, Stri
     Ok(trimmed.to_string())
 }
 
+#[tauri::command]
+fn start_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.start_dragging().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn toggle_window_maximize(window: tauri::WebviewWindow) -> Result<(), String> {
+    let is_max = window.is_maximized().unwrap_or(false);
+    if is_max {
+        window.unmaximize().map_err(|e| e.to_string())
+    } else {
+        window.maximize().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+async fn install_runtime_dependencies(app: tauri::AppHandle) -> Result<SystemCapabilities, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let emit_progress = |step: &str, percent: u8, message: &str| {
+            let _ = app.emit(
+                "setup-progress",
+                SetupProgressEvent {
+                    step: step.to_string(),
+                    percent,
+                    message: message.to_string(),
+                },
+            );
+        };
+
+        let runtime_dir = app_runtime_dir();
+        let bin_dir = runtime_dir.join("bin");
+        let venv_dir = runtime_dir.join("venv");
+        fs::create_dir_all(&bin_dir)
+            .map_err(|e| format!("Failed to create runtime directory: {}", e))?;
+
+        let existing_path = env::var("PATH").unwrap_or_default();
+        let enriched_path = format!(
+            "{}:/opt/homebrew/bin:/usr/local/bin:{}",
+            bin_dir.display(),
+            existing_path
+        );
+
+        // Step 1: Ensure FFmpeg is available
+        emit_progress("ffmpeg", 10, "Checking FFmpeg video engine...");
+        if search_binary(&["ffmpeg"]).is_none() {
+            emit_progress("ffmpeg", 18, "Downloading FFmpeg for macOS...");
+            if let Some((_, brew_bin)) = search_binary(&["brew"]) {
+                let _ = Command::new(brew_bin)
+                    .env("PATH", &enriched_path)
+                    .args(["install", "ffmpeg"])
+                    .status();
+            }
+            if search_binary(&["ffmpeg"]).is_none() {
+                let zip_path = bin_dir.join("ffmpeg.zip");
+                let target_ffmpeg = bin_dir.join("ffmpeg");
+                let dl = Command::new("curl")
+                    .args([
+                        "-L",
+                        "-sS",
+                        "--fail",
+                        "https://evermeet.cx/ffmpeg/getrelease/zip",
+                        "-o",
+                    ])
+                    .arg(&zip_path)
+                    .status();
+                if dl.map(|s| s.success()).unwrap_or(false) && zip_path.is_file() {
+                    let _ = Command::new("unzip")
+                        .args(["-o", "-q"])
+                        .arg(&zip_path)
+                        .arg("-d")
+                        .arg(&bin_dir)
+                        .status();
+                    let _ = fs::remove_file(&zip_path);
+                    let _ = Command::new("chmod").arg("+x").arg(&target_ffmpeg).status();
+                }
+            }
+        }
+
+        // Step 2: Ensure uv + Python 3.10 venv + torchaudio, uroman, pykakasi
+        emit_progress("python", 35, "Checking AI lyrics alignment runtime...");
+        if find_mms_python().is_none() {
+            let uv_bin = if let Some((_, existing_uv)) = search_binary(&["uv"]) {
+                existing_uv
+            } else {
+                emit_progress("python", 42, "Installing lightweight Python package manager (uv)...");
+                let install_cmd = format!(
+                    "curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR='{}' sh",
+                    bin_dir.display()
+                );
+                let _ = Command::new("sh").args(["-c", &install_cmd]).status();
+                bin_dir.join("uv")
+            };
+
+            if !uv_bin.is_file() {
+                return Err("Could not install uv package manager. Please check your internet connection.".to_string());
+            }
+
+            emit_progress("python", 55, "Creating isolated Python 3.10 environment...");
+            let venv_status = Command::new(&uv_bin)
+                .env("PATH", &enriched_path)
+                .args(["venv", "--python", "3.10"])
+                .arg(&venv_dir)
+                .status()
+                .map_err(|e| format!("Failed to create Python venv: {}", e))?;
+
+            if !venv_status.success() {
+                return Err("Failed to initialize Python 3.10 virtual environment.".to_string());
+            }
+
+            emit_progress(
+                "packages",
+                68,
+                "Installing PyTorch Audio & universal phonetic libraries (torchaudio, uroman, pykakasi)...",
+            );
+            let venv_py = venv_dir.join("bin/python");
+            let pip_status = Command::new(&uv_bin)
+                .env("PATH", &enriched_path)
+                .args([
+                    "pip",
+                    "install",
+                    "--python",
+                    &venv_py.to_string_lossy(),
+                    "torchaudio",
+                    "uroman",
+                    "pykakasi",
+                    "numpy",
+                ])
+                .status()
+                .map_err(|e| format!("Failed to install AI packages: {}", e))?;
+
+            if !pip_status.success() {
+                return Err("Failed to install torchaudio and phonetic alignment packages.".to_string());
+            }
+        }
+
+        // Step 3: Ensure MMS_FA model checkpoint is downloaded and cached
+        if let Some(py_bin) = find_mms_python() {
+            emit_progress(
+                "model",
+                85,
+                "Downloading & verifying Meta MMS_FA phonetic alignment model (one-time setup)...",
+            );
+            let _ = Command::new(&py_bin)
+                .env("PATH", &enriched_path)
+                .args([
+                    "-c",
+                    "from torchaudio.pipelines import MMS_FA; MMS_FA.get_model(with_star=True)",
+                ])
+                .status();
+        }
+
+        emit_progress("done", 100, "KaraoCraft studio setup complete!");
+        Ok(check_system_capabilities())
+    })
+    .await
+    .map_err(|e| format!("Installer task panicked: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1073,7 +1256,10 @@ pub fn run() {
             open_audio_dialog,
             open_project_dialog,
             save_project_dialog,
-            write_project_file
+            write_project_file,
+            start_window_drag,
+            toggle_window_maximize,
+            install_runtime_dependencies
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

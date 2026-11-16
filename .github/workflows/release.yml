@@ -1,0 +1,57 @@
+name: Release macOS DMG
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run automated test suite
+        run: npm run test
+
+      - name: Build Tauri macOS .app and .dmg
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'KaraoCraft ${{ github.ref_name }}'
+          releaseBody: |
+            ## 🎤 KaraoCraft ${{ github.ref_name }} — macOS Apple Silicon Release
+
+            ### 📦 Installation (macOS)
+            1. Download **`KaraoCraft_0.2.0_aarch64.dmg`** below and drag **KaraoCraft.app** into your `/Applications` folder.
+            2. **First Launch (Unsigned Build Note):** If macOS Gatekeeper shows a warning, right-click **KaraoCraft.app** → **Open**, or run once in Terminal:
+               ```bash
+               xattr -cr /Applications/KaraoCraft.app
+               ```
+            3. **Automatic First-Run Setup:** On first launch, KaraoCraft will offer to automatically download and configure its required video engine (**FFmpeg**) and local AI phonetic alignment runtime (**Meta MMS_FA**, `torchaudio`, `uroman`, `pykakasi`) with one click.
+          releaseDraft: false
+          prerelease: false

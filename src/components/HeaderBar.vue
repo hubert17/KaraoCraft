@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount } from 'vue';
-import { useProjectStore } from '../stores/projectStore';
+import { invoke } from '@tauri-apps/api/core';
+import { useProjectStore, showAboutModalRef } from '../stores/projectStore';
 import {
   FilePlus2,
   FolderOpen,
@@ -10,6 +11,7 @@ import {
   ChevronDown,
   Check,
   AlertCircle,
+  Info,
   X,
 } from '@lucide/vue';
 
@@ -17,6 +19,27 @@ const project = useProjectStore();
 const loadInputRef = ref<HTMLInputElement | null>(null);
 const showSaveMenu = ref(false);
 const saveSplitRef = ref<HTMLElement | null>(null);
+
+function isInteractiveElement(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || typeof el.closest !== 'function') return false;
+  return Boolean(el.closest('button, input, a, select, textarea, .titlebar-no-drag'));
+}
+
+function onTitlebarMouseDown(e: MouseEvent) {
+  if (e.button !== 0 || isInteractiveElement(e.target)) return;
+  if (!project.isTauriEnv) return;
+  if (e.detail === 1) {
+    void invoke('start_window_drag').catch(() => undefined);
+  }
+}
+
+function onTitlebarDoubleClick(e: MouseEvent) {
+  if (isInteractiveElement(e.target)) return;
+  if (!project.isTauriEnv) return;
+  e.preventDefault();
+  void invoke('toggle_window_maximize').catch(() => undefined);
+}
 
 function handleBackToSetup() {
   project.pauseAudio();
@@ -85,7 +108,10 @@ onBeforeUnmount(() => {
 
 <template>
   <header
-    class="w-full bg-white border-b border-slate-200 select-none shrink-0 titlebar-drag relative"
+    data-tauri-drag-region
+    @mousedown="onTitlebarMouseDown"
+    @dblclick="onTitlebarDoubleClick"
+    class="w-full bg-white border-b border-slate-200 select-none shrink-0 titlebar-drag relative cursor-default"
     :class="project.screen === 'setup' ? 'pt-7 pb-3 px-8' : 'pt-6 pb-2.5 px-6'"
   >
     <input
@@ -134,16 +160,25 @@ onBeforeUnmount(() => {
         >
           <FolderOpen class="w-4 h-4" />
         </button>
+        <button
+          type="button"
+          @click="showAboutModalRef = true"
+          title="About KaraoCraft"
+          aria-label="About KaraoCraft"
+          class="inline-flex items-center justify-center bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl p-2 shadow-sm transition-colors"
+        >
+          <Info class="w-4 h-4" />
+        </button>
       </div>
     </div>
 
     <!-- Editor Screen Header: Left Brand on Musical Staff + Song Badge + Actions (Slide 2 style) -->
     <div v-else class="w-full musical-staff-bg py-1 flex items-center justify-between gap-4 pl-14">
-      <div class="flex items-center gap-4 titlebar-no-drag">
+      <div class="flex items-center gap-4">
         <button
           type="button"
           @click="handleBackToSetup"
-          class="bg-white/95 hover:bg-slate-50 px-3 py-1 rounded-xl border border-transparent hover:border-slate-200 flex items-center gap-2 transition-all group"
+          class="bg-white/95 hover:bg-slate-50 px-3 py-1 rounded-xl border border-transparent hover:border-slate-200 flex items-center gap-2 transition-all group titlebar-no-drag"
           title="Back to Song Setup"
         >
           <ArrowLeft class="w-4 h-4 text-slate-400 group-hover:text-slate-800 transition-colors" />

@@ -10,7 +10,7 @@ function adjustTextSize(delta: number) {
   project.options.textSize = next;
 }
 
-function applyPreset(preset: 'croonify' | 'gold' | 'magenta') {
+function applyPreset(preset: 'croonify' | 'gold' | 'magenta' | 'emerald' | 'crimson') {
   if (preset === 'croonify') {
     project.options.bgColor = '#000000';
     project.options.activeColor = '#3dbeff';
@@ -21,11 +21,21 @@ function applyPreset(preset: 'croonify' | 'gold' | 'magenta') {
     project.options.activeColor = '#facc15';
     project.options.unsungColor = '#ffffff';
     project.options.outlineColor = '#1e293b';
-  } else {
+  } else if (preset === 'magenta') {
     project.options.bgColor = '#0f0720';
     project.options.activeColor = '#f472b6';
     project.options.unsungColor = '#ffffff';
     project.options.outlineColor = '#6d28d9';
+  } else if (preset === 'emerald') {
+    project.options.bgColor = '#04130e';
+    project.options.activeColor = '#34d399';
+    project.options.unsungColor = '#ffffff';
+    project.options.outlineColor = '#065f46';
+  } else if (preset === 'crimson') {
+    project.options.bgColor = '#120608';
+    project.options.activeColor = '#ff4d4f';
+    project.options.unsungColor = '#ffffff';
+    project.options.outlineColor = '#991b1b';
   }
 }
 </script>
@@ -249,20 +259,32 @@ function applyPreset(preset: 'croonify' | 'gold' | 'magenta') {
                 <button
                   type="button"
                   @click="applyPreset('croonify')"
-                  class="w-5 h-5 rounded-full bg-[#004bfa] border border-slate-300"
+                  class="w-5 h-5 rounded-full bg-[#004bfa] border border-slate-300 hover:scale-110 transition-transform cursor-pointer"
                   title="Classic Croonify Blue"
                 ></button>
                 <button
                   type="button"
                   @click="applyPreset('gold')"
-                  class="w-5 h-5 rounded-full bg-[#facc15] border border-slate-300"
+                  class="w-5 h-5 rounded-full bg-[#facc15] border border-slate-300 hover:scale-110 transition-transform cursor-pointer"
                   title="Classic Gold Karaoke"
                 ></button>
                 <button
                   type="button"
                   @click="applyPreset('magenta')"
-                  class="w-5 h-5 rounded-full bg-[#f472b6] border border-slate-300"
+                  class="w-5 h-5 rounded-full bg-[#f472b6] border border-slate-300 hover:scale-110 transition-transform cursor-pointer"
                   title="Pop Magenta"
+                ></button>
+                <button
+                  type="button"
+                  @click="applyPreset('emerald')"
+                  class="w-5 h-5 rounded-full bg-[#10b981] border border-slate-300 hover:scale-110 transition-transform cursor-pointer"
+                  title="KTV Emerald Mint"
+                ></button>
+                <button
+                  type="button"
+                  @click="applyPreset('crimson')"
+                  class="w-5 h-5 rounded-full bg-[#ef4444] border border-slate-300 hover:scale-110 transition-transform cursor-pointer"
+                  title="Stage Ruby Red"
                 ></button>
               </div>
             </div>

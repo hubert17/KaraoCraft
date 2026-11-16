@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { useProjectStore, type EditorTab } from '../stores/projectStore';
+import { useProjectStore, showAboutModalRef, type EditorTab } from '../stores/projectStore';
+import { Info } from '@lucide/vue';
 
 const project = useProjectStore();
 
@@ -109,6 +110,14 @@ function selectTab(tab: EditorTab) {
         <span>Frames</span>
         <span class="font-semibold text-slate-800">{{ project.totalFramesCount }}</span>
       </div>
+      <button
+        type="button"
+        @click="showAboutModalRef = true"
+        class="mt-2 w-full inline-flex items-center justify-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-brand-purple bg-slate-50 hover:bg-purple-50 border border-slate-200/80 rounded-lg py-1.5 transition-colors"
+      >
+        <Info class="w-3.5 h-3.5" />
+        <span>About KaraoCraft</span>
+      </button>
     </div>
   </aside>
 </template>

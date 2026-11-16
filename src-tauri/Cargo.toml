@@ -1,7 +1,7 @@
 [package]
 name = "tauri-app"
-version = "0.1.0"
-description = "A Tauri App"
+version = "0.2.0"
+description = "KaraoCraft — macOS Karaoke Video Studio"
 authors = ["you"]
 edition = "2024"
 

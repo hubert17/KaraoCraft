@@ -58,12 +58,17 @@ interface LocalAudioFilePayload {
 const LF = String.fromCharCode(10);
 const CR = String.fromCharCode(13);
 
+export const showAboutModalRef = ref(false);
+export const showFirstRunSetupRef = ref(false);
+
 export const useProjectStore = defineStore('project', () => {
   // Navigation & Modals
   const screen = ref<AppScreen>('setup');
   const activeTab = ref<EditorTab>('line-timings');
   const showResyncModal = ref(false);
   const showUvrGuideModal = ref(false);
+  const showAboutModal = showAboutModalRef;
+  const showFirstRunSetupModal = showFirstRunSetupRef;
 
   // System Capabilities (Tauri backend)
   const isTauriEnv = ref(typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
@@ -218,12 +223,15 @@ export const useProjectStore = defineStore('project', () => {
     return -1;
   });
 
-  async function detectSystemCapabilities() {
+  async function detectSystemCapabilities(promptIfMissing = false) {
     isTauriEnv.value = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
     if (!isTauriEnv.value) return;
     try {
       const caps = await invoke<SystemCapabilities>('check_system_capabilities');
       systemCaps.value = caps;
+      if (promptIfMissing && (!caps.ffmpegAvailable || !caps.whisperAvailable)) {
+        showFirstRunSetupRef.value = true;
+      }
     } catch {
       // Running in browser dev mode
     }
@@ -1019,6 +1027,8 @@ export const useProjectStore = defineStore('project', () => {
     activeTab,
     showResyncModal,
     showUvrGuideModal,
+    showAboutModal,
+    showFirstRunSetupModal,
     isTauriEnv,
     systemCaps,
     vocalFile,
