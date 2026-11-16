@@ -7,6 +7,9 @@ import {
   Pause,
   Film,
   Music,
+  Headphones,
+  Mic,
+  ImagePlus,
   FileCode,
   FileText,
   FolderOpen,
@@ -19,7 +22,20 @@ import {
 const project = useProjectStore();
 
 const instInputRef = ref<HTMLInputElement | null>(null);
+const bgImageInputRef = ref<HTMLInputElement | null>(null);
 const renderQuality = ref<'1080p' | '720p'>('1080p');
+
+const offsetOptions = [
+  { value: -2, label: '-2.0s (Earlier)' },
+  { value: -1.5, label: '-1.5s' },
+  { value: -1, label: '-1.0s' },
+  { value: -0.5, label: '-0.5s' },
+  { value: 0, label: '0s (Default)' },
+  { value: 0.5, label: '+0.5s' },
+  { value: 1, label: '+1.0s' },
+  { value: 1.5, label: '+1.5s' },
+  { value: 2, label: '+2.0s (Later)' },
+];
 const exportAudioChoice = ref<'instrumental' | 'vocal'>(
   project.instrumentalFile ? 'instrumental' : 'vocal'
 );
@@ -50,6 +66,22 @@ function onInstSelect(e: Event) {
   const file = input.files?.[0];
   if (file) {
     project.selectInstrumentalFile(file);
+  }
+  input.value = '';
+}
+
+async function handleBrowseBgImage() {
+  const handledNatively = await project.browseBgImageFile();
+  if (!handledNatively) {
+    bgImageInputRef.value?.click();
+  }
+}
+
+function onBgImageSelect(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (file) {
+    project.selectBgImageFile(file);
   }
   input.value = '';
 }
@@ -90,45 +122,159 @@ function onInstSelect(e: Event) {
             </span>
           </div>
 
-          <!-- Audio Monitoring Switcher (when Instrumental is attached) -->
-          <div v-if="project.instrumentalFile" class="flex items-center justify-center gap-2 pt-1">
+          <!-- Lyrics Offset + Audio Monitoring Switcher (Icon-Only) + Image Background Button -->
+          <div class="flex flex-wrap items-center justify-center gap-2 pt-1">
+            <!-- Full Lyrics Time Offset (-2.0s to +2.0s in 0.5s steps) -->
+            <div class="flex items-center gap-1.5">
+              <label for="lyrics-offset-select" class="text-sm font-semibold text-slate-600">
+                Lyrics Offset:
+              </label>
+              <select
+                id="lyrics-offset-select"
+                :value="project.lyricsOffsetSec"
+                @change="project.lyricsOffsetSec = Number(($event.target as HTMLSelectElement).value)"
+                class="h-9 rounded-lg border border-slate-300 bg-white px-2.5 text-sm font-semibold text-slate-800 hover:border-slate-400 focus:outline-none focus:ring-2 focus:ring-brand-purple/30 cursor-pointer"
+                title="Shift all lyrics timings earlier (-) or later (+)"
+              >
+                <option v-for="opt in offsetOptions" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
+                </option>
+              </select>
+            </div>
+
+            <div class="h-5 w-px bg-slate-300 mx-1.5"></div>
+
             <span class="text-sm font-semibold text-slate-600 mr-1">Preview Audio:</span>
-            <button
-              type="button"
-              @click="project.setMixMode('instrumental')"
-              class="px-3.5 py-1.5 rounded-lg text-sm font-semibold transition-colors"
-              :class="
-                project.mixMode === 'instrumental'
-                  ? 'bg-brand-purple text-white'
-                  : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
-              "
-            >
-              Instrumental Only
-            </button>
-            <button
-              type="button"
-              @click="project.setMixMode('mix')"
-              class="px-3.5 py-1.5 rounded-lg text-sm font-semibold transition-colors"
-              :class="
-                project.mixMode === 'mix'
-                  ? 'bg-brand-purple text-white'
-                  : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
-              "
-            >
-              Guide Mix (Both)
-            </button>
-            <button
-              type="button"
-              @click="project.setMixMode('vocal')"
-              class="px-3.5 py-1.5 rounded-lg text-sm font-semibold transition-colors"
-              :class="
-                project.mixMode === 'vocal'
-                  ? 'bg-brand-purple text-white'
-                  : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
-              "
-            >
-              Vocal Stem Only
-            </button>
+
+            <!-- Instrumental Only -->
+            <div class="relative group">
+              <button
+                type="button"
+                :disabled="!project.instrumentalFile"
+                @click="project.setMixMode('instrumental')"
+                class="w-9 h-9 rounded-lg flex items-center justify-center transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                :class="
+                  project.mixMode === 'instrumental' && project.instrumentalFile
+                    ? 'bg-brand-purple text-white shadow-sm'
+                    : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
+                "
+                aria-label="Instrumental Only"
+              >
+                <Music class="w-4 h-4" />
+              </button>
+              <div
+                class="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2.5 py-1 rounded-md bg-slate-900 text-white text-xs font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-sm z-30"
+              >
+                {{
+                  project.instrumentalFile
+                    ? 'Instrumental Only'
+                    : 'Instrumental Only (attach track below)'
+                }}
+              </div>
+            </div>
+
+            <!-- Guide Mix (Both) -->
+            <div class="relative group">
+              <button
+                type="button"
+                :disabled="!project.instrumentalFile"
+                @click="project.setMixMode('mix')"
+                class="w-9 h-9 rounded-lg flex items-center justify-center transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                :class="
+                  project.mixMode === 'mix' && project.instrumentalFile
+                    ? 'bg-brand-purple text-white shadow-sm'
+                    : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
+                "
+                aria-label="Guide Mix (Both)"
+              >
+                <Headphones class="w-4 h-4" />
+              </button>
+              <div
+                class="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2.5 py-1 rounded-md bg-slate-900 text-white text-xs font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-sm z-30"
+              >
+                {{
+                  project.instrumentalFile
+                    ? 'Guide Mix (Both)'
+                    : 'Guide Mix (attach track below)'
+                }}
+              </div>
+            </div>
+
+            <!-- Vocal Stem Only -->
+            <div class="relative group">
+              <button
+                type="button"
+                @click="project.setMixMode('vocal')"
+                class="w-9 h-9 rounded-lg flex items-center justify-center transition-colors cursor-pointer"
+                :class="
+                  project.mixMode === 'vocal' || !project.instrumentalFile
+                    ? 'bg-brand-purple text-white shadow-sm'
+                    : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
+                "
+                aria-label="Vocal Stem Only"
+              >
+                <Mic class="w-4 h-4" />
+              </button>
+              <div
+                class="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2.5 py-1 rounded-md bg-slate-900 text-white text-xs font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-sm z-30"
+              >
+                Vocal Stem Only
+              </div>
+            </div>
+
+            <div class="h-5 w-px bg-slate-300 mx-1.5"></div>
+
+            <!-- Hidden file input fallback for browser mode -->
+            <input
+              ref="bgImageInputRef"
+              type="file"
+              accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp"
+              class="hidden"
+              @change="onBgImageSelect"
+            />
+
+            <!-- Add / Change Image Background Button -->
+            <div class="relative group">
+              <button
+                type="button"
+                @click="handleBrowseBgImage"
+                class="w-9 h-9 rounded-lg flex items-center justify-center transition-colors cursor-pointer"
+                :class="
+                  project.bgImageDataUrl
+                    ? 'bg-brand-purple text-white shadow-sm'
+                    : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-100'
+                "
+                aria-label="Add Image Background"
+              >
+                <ImagePlus class="w-4 h-4" />
+              </button>
+              <div
+                class="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2.5 py-1 rounded-md bg-slate-900 text-white text-xs font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-sm z-30"
+              >
+                {{
+                  project.bgImageFileName
+                    ? `Background: ${project.bgImageFileName} (Click to change)`
+                    : 'Add Image Background'
+                }}
+              </div>
+            </div>
+
+            <!-- Clear Image Background Button (when active) -->
+            <div v-if="project.bgImageDataUrl" class="relative group">
+              <button
+                type="button"
+                @click="project.selectBgImageFile(null)"
+                class="w-9 h-9 rounded-lg bg-white border border-slate-300 text-slate-500 hover:text-red-600 hover:border-red-300 hover:bg-red-50 flex items-center justify-center transition-colors cursor-pointer"
+                aria-label="Remove Image Background"
+              >
+                <X class="w-4 h-4" />
+              </button>
+              <div
+                class="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2.5 py-1 rounded-md bg-slate-900 text-white text-xs font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-sm z-30"
+              >
+                Remove Image Background
+              </div>
+            </div>
           </div>
         </div>
       </div>

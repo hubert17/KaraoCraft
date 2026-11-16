@@ -12,6 +12,7 @@ import {
   type WhisperWordInput,
 } from '../services/alignmentEngine';
 import {
+  applyLyricsOffset,
   generateAssSubtitle,
   generateEnhancedLrc,
   getResolutionDimensions,
@@ -91,6 +92,11 @@ export const useProjectStore = defineStore('project', () => {
   const instrumentalFileName = ref('');
   const instrumentalFilePath = ref('');
 
+  const bgImageFile = ref<File | null>(null);
+  const bgImageFileName = ref('');
+  const bgImageFilePath = ref('');
+  const bgImageDataUrl = ref('');
+
   // Project File Persistence State
   const projectFilePath = ref<string | null>(null);
   const projectSaveStatus = ref<string | null>(null);
@@ -99,12 +105,16 @@ export const useProjectStore = defineStore('project', () => {
 
   const LAST_AUDIO_DIR_KEY = 'karaocraft:lastAudioDir';
   const LAST_PROJECT_DIR_KEY = 'karaocraft:lastProjectDir';
+  const LAST_IMAGE_DIR_KEY = 'karaocraft:lastImageDir';
 
   const lastAudioDir = ref<string>(
     typeof localStorage !== 'undefined' ? localStorage.getItem(LAST_AUDIO_DIR_KEY) || '' : ''
   );
   const lastProjectDir = ref<string>(
     typeof localStorage !== 'undefined' ? localStorage.getItem(LAST_PROJECT_DIR_KEY) || '' : ''
+  );
+  const lastImageDir = ref<string>(
+    typeof localStorage !== 'undefined' ? localStorage.getItem(LAST_IMAGE_DIR_KEY) || '' : ''
   );
 
   function extractParentDir(filePath: string): string {
@@ -135,6 +145,17 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  function rememberImagePath(filePath: string) {
+    const dir = extractParentDir(filePath);
+    if (!dir) return;
+    lastImageDir.value = dir;
+    try {
+      localStorage.setItem(LAST_IMAGE_DIR_KEY, dir);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
   const duration = ref(0);
   const waveformPeaks = ref<Float32Array | null>(null);
   const peaksPerSecond = ref(120);
@@ -155,6 +176,8 @@ export const useProjectStore = defineStore('project', () => {
 
   // Alignment & Timing State
   const lines = ref<AlignedLyricLine[]>([]);
+  const lyricsOffsetSec = ref<number>(0);
+  const shiftedLines = computed(() => applyLyricsOffset(lines.value, lyricsOffsetSec.value));
   const selectedLineIndex = ref(0);
   const selectedWordId = ref<string | null>(null);
   const isAligning = ref(false);
@@ -352,6 +375,52 @@ export const useProjectStore = defineStore('project', () => {
       if (!payload) return true; // User cancelled dialog
       const fileObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
       await selectInstrumentalFile(fileObj, payload.filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function selectBgImageFile(file: File | null, explicitPath?: string) {
+    bgImageFile.value = file;
+    bgImageFileName.value = file ? file.name : '';
+    if (!file) {
+      bgImageFilePath.value = '';
+      bgImageDataUrl.value = '';
+      return;
+    }
+
+    if (explicitPath) {
+      bgImageFilePath.value = explicitPath;
+      rememberImagePath(explicitPath);
+    } else if (isTauriEnv.value) {
+      try {
+        const resolved = await invoke<string | null>('resolve_local_audio_path', {
+          fileName: file.name,
+          fileSize: file.size,
+        });
+        bgImageFilePath.value = resolved || '';
+        if (resolved) rememberImagePath(resolved);
+      } catch {
+        bgImageFilePath.value = '';
+      }
+    }
+
+    const b64 = await fileToBase64(file);
+    const mime = file.type || 'image/png';
+    bgImageDataUrl.value = `data:${mime};base64,${b64}`;
+  }
+
+  async function browseBgImageFile(): Promise<boolean> {
+    if (!isTauriEnv.value) return false;
+    try {
+      const payload = await invoke<LocalAudioFilePayload | null>('open_image_dialog', {
+        prompt: 'Select Background Image',
+        initialDir: bgImageFilePath.value || lastImageDir.value || null,
+      });
+      if (!payload) return true; // User cancelled dialog
+      const fileObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+      await selectBgImageFile(fileObj, payload.filePath);
       return true;
     } catch {
       return false;
@@ -721,10 +790,11 @@ export const useProjectStore = defineStore('project', () => {
     const content = generateAssSubtitle({
       title: title.value,
       artist: artist.value,
-      lines: lines.value,
+      lines: shiftedLines.value,
       options: options.value,
       durationSec: duration.value,
       quality: '1080p',
+      hasBackgroundImage: Boolean(bgImageFile.value || bgImageDataUrl.value),
     });
     const safeName = sanitizeFileBase(title.value, 'KaraoCraft_Lyrics');
     triggerBrowserDownload(`${safeName}.ass`, content, 'text/plain;charset=utf-8');
@@ -734,7 +804,7 @@ export const useProjectStore = defineStore('project', () => {
     const content = generateEnhancedLrc({
       title: title.value,
       artist: artist.value,
-      lines: lines.value,
+      lines: shiftedLines.value,
     });
     const safeName = sanitizeFileBase(title.value, 'KaraoCraft_Lyrics');
     triggerBrowserDownload(`${safeName}.lrc`, content, 'text/plain;charset=utf-8');
@@ -760,6 +830,9 @@ export const useProjectStore = defineStore('project', () => {
       vocalFilePath: vocalFilePath.value,
       instrumentalFileName: instrumentalFileName.value,
       instrumentalFilePath: instrumentalFilePath.value,
+      bgImageFileName: bgImageFileName.value,
+      bgImageFilePath: bgImageFilePath.value,
+      lyricsOffsetSec: lyricsOffsetSec.value,
       duration: duration.value,
       options: options.value,
       lines: lines.value,
@@ -839,6 +912,7 @@ export const useProjectStore = defineStore('project', () => {
     }
 
     lines.value = data.lines;
+    lyricsOffsetSec.value = typeof data.lyricsOffsetSec === 'number' ? data.lyricsOffsetSec : 0;
     assignFramesToLines(lines.value, options.value.linesPerFrame);
     if (typeof data.duration === 'number' && data.duration > 0) {
       duration.value = data.duration;
@@ -848,6 +922,10 @@ export const useProjectStore = defineStore('project', () => {
     if (typeof data.vocalFilePath === 'string') vocalFilePath.value = data.vocalFilePath;
     if (typeof data.instrumentalFileName === 'string') instrumentalFileName.value = data.instrumentalFileName;
     if (typeof data.instrumentalFilePath === 'string') instrumentalFilePath.value = data.instrumentalFilePath;
+    bgImageFile.value = null;
+    bgImageDataUrl.value = '';
+    bgImageFileName.value = typeof data.bgImageFileName === 'string' ? data.bgImageFileName : '';
+    bgImageFilePath.value = typeof data.bgImageFilePath === 'string' ? data.bgImageFilePath : '';
 
     if (sourceFilePath) {
       projectFilePath.value = sourceFilePath;
@@ -885,6 +963,19 @@ export const useProjectStore = defineStore('project', () => {
         // Non-fatal if optional instrumental stem was moved
       }
     }
+
+    if (isTauriEnv.value && (data.bgImageFilePath || data.bgImageFileName)) {
+      try {
+        const payload = await invoke<LocalAudioFilePayload>('read_local_image_file', {
+          filePath: data.bgImageFilePath || null,
+          fileName: data.bgImageFileName || null,
+        });
+        const imgObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+        await selectBgImageFile(imgObj, payload.filePath);
+      } catch {
+        // Non-fatal if optional background image was moved
+      }
+    }
   }
 
   async function openProjectFromDialog() {
@@ -914,6 +1005,10 @@ export const useProjectStore = defineStore('project', () => {
     instrumentalFile.value = null;
     instrumentalFileName.value = '';
     instrumentalFilePath.value = '';
+    bgImageFile.value = null;
+    bgImageFileName.value = '';
+    bgImageFilePath.value = '';
+    bgImageDataUrl.value = '';
     duration.value = 0;
     waveformPeaks.value = null;
     rmsEnvelope.value = null;
@@ -926,6 +1021,7 @@ export const useProjectStore = defineStore('project', () => {
     rawLyrics.value = '';
     syncedLyricsSnapshot.value = '';
     lines.value = [];
+    lyricsOffsetSec.value = 0;
     selectedLineIndex.value = 0;
     selectedWordId.value = null;
     undoStack.value = [];
@@ -971,18 +1067,22 @@ export const useProjectStore = defineStore('project', () => {
     lastExportedMp4Path.value = null;
 
     try {
+      const hasBgImage = Boolean(bgImageFile.value);
       const assContent = generateAssSubtitle({
         title: title.value,
         artist: artist.value,
-        lines: lines.value,
+        lines: shiftedLines.value,
         options: options.value,
         durationSec: duration.value,
         quality,
+        hasBackgroundImage: hasBgImage,
       });
 
       const { width, height } = getResolutionDimensions(options.value.aspectRatio, quality);
       const ext = sourceFile.name.split('.').pop() || 'mp3';
       const audioBase64 = await fileToBase64(sourceFile);
+      const bgImageBase64 = bgImageFile.value ? await fileToBase64(bgImageFile.value) : null;
+      const bgImageExt = bgImageFile.value ? bgImageFile.value.name.split('.').pop() || 'png' : null;
 
       const baseTitle = [artist.value.trim(), title.value.trim()].filter(Boolean).join(' - ') || 'KaraoCraft';
       const outputFilename = `${baseTitle} (Karaoke ${quality}).mp4`;
@@ -994,6 +1094,8 @@ export const useProjectStore = defineStore('project', () => {
             audioBase64,
             audioExt: ext,
             bgColor: options.value.bgColor,
+            bgImageBase64,
+            bgImageExt,
             width,
             height,
             durationSec: duration.value || 180,
@@ -1039,6 +1141,10 @@ export const useProjectStore = defineStore('project', () => {
     instrumentalFile,
     instrumentalFileName,
     instrumentalFilePath,
+    bgImageFile,
+    bgImageFileName,
+    bgImageFilePath,
+    bgImageDataUrl,
     projectFilePath,
     projectSaveStatus,
     projectFileError,
@@ -1056,6 +1162,8 @@ export const useProjectStore = defineStore('project', () => {
     rawLyrics,
     syncedLyricsSnapshot,
     lines,
+    lyricsOffsetSec,
+    shiftedLines,
     selectedLineIndex,
     selectedWordId,
     isAligning,
@@ -1075,8 +1183,10 @@ export const useProjectStore = defineStore('project', () => {
     detectSystemCapabilities,
     selectVocalFile,
     selectInstrumentalFile,
+    selectBgImageFile,
     browseVocalFile,
     browseInstrumentalFile,
+    browseBgImageFile,
     setMixMode,
     setPlaybackRate,
     togglePlay,

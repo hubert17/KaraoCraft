@@ -48,6 +48,8 @@ pub struct RenderMp4Request {
     pub audio_base64: String,
     pub audio_ext: String,
     pub bg_color: String,
+    pub bg_image_base64: Option<String>,
+    pub bg_image_ext: Option<String>,
     pub width: u32,
     pub height: u32,
     pub duration_sec: f64,
@@ -656,24 +658,73 @@ async fn render_karaoke_mp4(request: RenderMp4Request) -> Result<RenderMp4Respon
         };
 
         let duration = request.duration_sec.max(1.0);
+        let duration_str = format!("{:.3}", duration);
         let color_src = format!(
             "color=c=0x{}:s={}x{}:r=30:d={:.3}",
             safe_hex, request.width, request.height, duration
         );
+
+        // Optional Background Image pre-processing: scale to fill (maintain aspect ratio, no black bars) & center-crop
+        let mut prepared_bg_path: Option<PathBuf> = None;
+        if let Some(ref bg_b64) = request.bg_image_base64 {
+            if !bg_b64.trim().is_empty() {
+                if let Ok(bg_bytes) = decode_base64(bg_b64) {
+                    let raw_ext = request
+                        .bg_image_ext
+                        .as_deref()
+                        .unwrap_or("png")
+                        .trim_start_matches('.')
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect::<String>();
+                    let safe_img_ext = if raw_ext.is_empty() {
+                        "png".to_string()
+                    } else {
+                        raw_ext
+                    };
+                    let raw_bg_path = work_dir.join(format!("bg_raw.{}", safe_img_ext));
+                    let prep_path = work_dir.join("bg_prepared.png");
+                    if fs::write(&raw_bg_path, bg_bytes).is_ok() {
+                        let base_color_1s = format!(
+                            "color=c=0x{}:s={}x{}:r=1:d=1",
+                            safe_hex, request.width, request.height
+                        );
+                        let fc = format!(
+                            "[1:v]scale={}:{}:force_original_aspect_ratio=increase,crop={}:{},setsar=1[fg];[0:v][fg]overlay=0:0:shortest=1",
+                            request.width, request.height, request.width, request.height
+                        );
+                        let prep_run = Command::new(&ffmpeg_path)
+                            .current_dir(&work_dir)
+                            .args(["-y", "-f", "lavfi", "-i", &base_color_1s, "-i"])
+                            .arg(&raw_bg_path)
+                            .args(["-filter_complex", &fc, "-frames:v", "1"])
+                            .arg(&prep_path)
+                            .output();
+                        if prep_run.map(|o| o.status.success()).unwrap_or(false)
+                            && prep_path.is_file()
+                        {
+                            prepared_bg_path = Some(prep_path);
+                        }
+                    }
+                }
+            }
+        }
+
         let vf_arg = "ass=karaoke.ass";
         let bitrate = if request.height >= 1080 { "8M" } else { "4M" };
 
         // Attempt 1: Apple Silicon Hardware Encoder (h264_videotoolbox)
-        let hw_run = Command::new(&ffmpeg_path)
-            .current_dir(&work_dir)
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                &color_src,
-                "-i",
-            ])
+        let mut hw_cmd = Command::new(&ffmpeg_path);
+        hw_cmd.current_dir(&work_dir).arg("-y");
+        if let Some(ref bg_img) = prepared_bg_path {
+            hw_cmd
+                .args(["-loop", "1", "-framerate", "30", "-t", &duration_str, "-i"])
+                .arg(bg_img);
+        } else {
+            hw_cmd.args(["-f", "lavfi", "-i", &color_src]);
+        }
+        let hw_run = hw_cmd
+            .arg("-i")
             .arg(&audio_path)
             .args([
                 "-vf",
@@ -706,16 +757,17 @@ async fn render_karaoke_mp4(request: RenderMp4Request) -> Result<RenderMp4Respon
         }
 
         // Attempt 2: Software libx264 fallback
-        let sw_run = Command::new(&ffmpeg_path)
-            .current_dir(&work_dir)
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                &color_src,
-                "-i",
-            ])
+        let mut sw_cmd = Command::new(&ffmpeg_path);
+        sw_cmd.current_dir(&work_dir).arg("-y");
+        if let Some(ref bg_img) = prepared_bg_path {
+            sw_cmd
+                .args(["-loop", "1", "-framerate", "30", "-t", &duration_str, "-i"])
+                .arg(bg_img);
+        } else {
+            sw_cmd.args(["-f", "lavfi", "-i", &color_src]);
+        }
+        let sw_run = sw_cmd
+            .arg("-i")
             .arg(&audio_path)
             .args([
                 "-vf",
@@ -790,7 +842,7 @@ fn find_audio_path_on_disk(file_name: &str, file_size: Option<u64>) -> Option<Pa
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(home) = env::var("HOME") {
         let home_pb = PathBuf::from(&home);
-        for sub in ["Downloads", "Music", "Desktop", "Documents"] {
+        for sub in ["Downloads", "Music", "Pictures", "Desktop", "Documents"] {
             let p = home_pb.join(sub).join(trimmed);
             if p.is_file() {
                 candidates.push(p);
@@ -842,9 +894,164 @@ fn infer_audio_mime(path: &Path) -> String {
     }
 }
 
+fn infer_image_mime(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png".to_string(),
+        "jpg" | "jpeg" => "image/jpeg".to_string(),
+        "webp" => "image/webp".to_string(),
+        "gif" => "image/gif".to_string(),
+        "bmp" => "image/bmp".to_string(),
+        "svg" => "image/svg+xml".to_string(),
+        _ => "image/png".to_string(),
+    }
+}
+
+fn read_image_payload_from_path(target_path: &Path) -> Result<LocalAudioFilePayload, String> {
+    let ext = target_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let name = target_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("background.png")
+        .to_string();
+
+    // If user selected HEIC/HEIF/TIFF on macOS, convert in-memory bytes via `sips` so WebView & FFmpeg render seamlessly
+    if matches!(ext.as_str(), "heic" | "heif" | "tif" | "tiff") {
+        let tmp_png = env::temp_dir().join(format!("karaocraft_bg_{}.png", unique_stamp()));
+        let sips_ok = Command::new("sips")
+            .args(["-s", "format", "png"])
+            .arg(target_path)
+            .arg("--out")
+            .arg(&tmp_png)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if sips_ok && tmp_png.is_file() {
+            if let Ok(png_bytes) = fs::read(&tmp_png) {
+                let _ = fs::remove_file(&tmp_png);
+                return Ok(LocalAudioFilePayload {
+                    file_path: target_path.to_string_lossy().to_string(),
+                    file_name: name,
+                    base64_data: encode_base64(&png_bytes),
+                    mime_type: "image/png".to_string(),
+                });
+            }
+            let _ = fs::remove_file(&tmp_png);
+        }
+    }
+
+    let bytes = fs::read(target_path).map_err(|e| {
+        format!(
+            "Could not read image file '{}': {}",
+            target_path.display(),
+            e
+        )
+    })?;
+    let mime_type = infer_image_mime(target_path);
+
+    Ok(LocalAudioFilePayload {
+        file_path: target_path.to_string_lossy().to_string(),
+        file_name: name,
+        base64_data: encode_base64(&bytes),
+        mime_type,
+    })
+}
+
 #[tauri::command]
 fn resolve_local_audio_path(file_name: String, file_size: Option<u64>) -> Option<String> {
     find_audio_path_on_disk(&file_name, file_size).map(|p| p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn read_local_image_file(
+    file_path: Option<String>,
+    file_name: Option<String>,
+) -> Result<LocalAudioFilePayload, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut resolved: Option<PathBuf> = None;
+
+        if let Some(ref fp) = file_path {
+            let p = PathBuf::from(fp.trim());
+            if p.is_file() {
+                resolved = Some(p);
+            }
+        }
+
+        if resolved.is_none() {
+            if let Some(ref fnm) = file_name {
+                resolved = find_audio_path_on_disk(fnm, None);
+            } else if let Some(ref fp) = file_path {
+                if let Some(base) = Path::new(fp).file_name().and_then(|s| s.to_str()) {
+                    resolved = find_audio_path_on_disk(base, None);
+                }
+            }
+        }
+
+        let Some(target_path) = resolved else {
+            let label = file_path
+                .or(file_name)
+                .unwrap_or_else(|| "image file".to_string());
+            return Err(format!("Background image file not found at: {}", label));
+        };
+
+        read_image_payload_from_path(&target_path)
+    })
+    .await
+    .map_err(|e| format!("Read image task panicked: {}", e))?
+}
+
+#[tauri::command]
+async fn open_image_dialog(
+    prompt: Option<String>,
+    initial_dir: Option<String>,
+) -> Result<Option<LocalAudioFilePayload>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let default_pictures = env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join("Pictures").to_string_lossy().to_string());
+        let start_dir = resolve_dialog_dir(initial_dir.as_deref(), default_pictures.as_deref());
+        let title = prompt.unwrap_or_else(|| "Select Background Image".to_string());
+
+        let script = r#"
+            on run argv
+                set dlgPrompt to item 1 of argv
+                set defDir to POSIX file (item 2 of argv)
+                try
+                    set chosenFile to choose file with prompt dlgPrompt of type {"public.image", "png", "jpg", "jpeg", "webp", "heic", "bmp", "gif", "tiff"} default location defDir
+                    return POSIX path of chosenFile
+                on error number -128
+                    return ""
+                end try
+            end run
+        "#;
+
+        let out = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(&title)
+            .arg(start_dir.to_string_lossy().to_string())
+            .output()
+            .map_err(|e| format!("Failed to open image file dialog: {}", e))?;
+
+        let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+
+        let target_path = PathBuf::from(&chosen);
+        let payload = read_image_payload_from_path(&target_path)?;
+        Ok(Some(payload))
+    })
+    .await
+    .map_err(|e| format!("Open image dialog task panicked: {}", e))?
 }
 
 #[tauri::command]
@@ -1253,7 +1460,9 @@ pub fn run() {
             reveal_in_finder,
             resolve_local_audio_path,
             read_local_audio_file,
+            read_local_image_file,
             open_audio_dialog,
+            open_image_dialog,
             open_project_dialog,
             save_project_dialog,
             write_project_file,

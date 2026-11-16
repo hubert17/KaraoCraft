@@ -3,7 +3,10 @@ import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useProjectStore } from '../stores/projectStore';
 import {
   buildKaraokePresentationTimeline,
+  computeBackgroundImageOpacity,
   computeFadeOpacity,
+  computeOutroWatermarkOpacity,
+  OUTRO_WATERMARK_TEXT,
   type ScheduledKaraokeLine,
 } from '../services/subtitleExporter';
 import type { WordSegment } from '../services/alignmentEngine';
@@ -48,7 +51,7 @@ onUnmounted(() => {
 
 const timeline = computed(() =>
   buildKaraokePresentationTimeline({
-    lines: project.lines,
+    lines: project.shiftedLines,
     durationSec: project.duration,
     linesPerFrame: project.options.linesPerFrame,
     title: project.title,
@@ -57,6 +60,14 @@ const timeline = computed(() =>
 );
 
 const frameGroups = computed(() => timeline.value.groups);
+
+const bgImageOpacity = computed(() => {
+  if (!project.bgImageDataUrl) return 0;
+  if (props.editableBox && !project.isPlaying) {
+    return 0.6;
+  }
+  return computeBackgroundImageOpacity(project.currentTime, timeline.value, project.duration);
+});
 
 const activeTitleCard = computed(() => {
   if (props.editableBox && !project.isPlaying) return null;
@@ -73,7 +84,7 @@ const activeTitleCard = computed(() => {
             intro.fadeInSec,
             intro.fadeOutSec
           );
-    return { opacity };
+    return { opacity, isIntro: true };
   }
   const outro = timeline.value.outroCard;
   if (outro && t >= outro.startSec && t <= outro.endSec) {
@@ -84,9 +95,14 @@ const activeTitleCard = computed(() => {
       outro.fadeInSec,
       outro.fadeOutSec
     );
-    return { opacity };
+    return { opacity, isIntro: false };
   }
   return null;
+});
+
+const outroWatermarkOpacity = computed(() => {
+  if (props.editableBox && !project.isPlaying) return 0;
+  return computeOutroWatermarkOpacity(project.currentTime, timeline.value.outroCard);
 });
 
 // Sample preview lines used in Options mode so the user always sees a full frame with bounding box & colors
@@ -298,6 +314,15 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
         maxWidth: '100%',
       }"
     >
+      <!-- Optional Aspect-Fill Background Image Layer (blends over bgColor via dynamic opacity) -->
+      <img
+        v-if="project.bgImageDataUrl"
+        :src="project.bgImageDataUrl"
+        alt="Background"
+        class="absolute inset-0 w-full h-full object-cover pointer-events-none select-none"
+        :style="{ opacity: bgImageOpacity }"
+      />
+
       <!-- Intro & Outro Song Title & Artist Card (with Fade In/Out) -->
       <div
         v-if="activeTitleCard"
@@ -306,6 +331,7 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
       >
         <div
           class="font-bold tracking-tight leading-tight"
+          :class="activeTitleCard.isIntro ? '-mt-6' : ''"
           :style="{
             fontSize: `${scaledFontSizePx * 1.18}px`,
             color: project.options.unsungColor,
@@ -325,6 +351,73 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
         >
           {{ project.artist }}
         </div>
+
+        <!-- Intro 5-Line Musical Staff (Pentagram) + Treble Clef + Script "KaraoCraft" Banner -->
+        <div
+          v-if="activeTitleCard.isIntro"
+          class="relative flex items-center justify-center"
+          :style="{
+            width: '76%',
+            height: `${Math.max(38, scaledFontSizePx * 2.15)}px`,
+            marginTop: `${Math.max(12, scaledFontSizePx * 0.65)}px`,
+          }"
+        >
+          <!-- 5 Horizontal Musical Staff Lines (Pentagram) Behind KaraoCraft -->
+          <div
+            v-for="idx in 5"
+            :key="idx"
+            class="absolute left-0 right-0 pointer-events-none"
+            :style="{
+              top: `${((idx - 1) / 4) * 100}%`,
+              height: `${Math.max(1.8, scaledFontSizePx * 0.085)}px`,
+              transform: 'translateY(-50%)',
+              backgroundColor: 'rgba(235, 246, 255, 0.88)',
+              boxShadow: `0 0 ${Math.max(4, scaledFontSizePx * 0.22)}px ${project.options.outlineColor}, 0 1px 2px rgba(0, 0, 0, 0.55)`,
+              borderRadius: '2px',
+            }"
+          ></div>
+
+          <!-- Treble Clef + Glowing Script KaraoCraft Overlaid on Staff -->
+          <div class="relative z-10 flex items-center justify-center gap-2 leading-none">
+            <span
+              :style="{
+                fontFamily: `'Apple Symbols', serif`,
+                fontSize: `${scaledFontSizePx * 1.85}px`,
+                color: '#ffffff',
+                WebkitTextStroke: `${Math.max(0.6, scaledFontSizePx * 0.035)}px rgba(147, 197, 253, 0.7)`,
+                textShadow: `0 0 ${Math.max(4, scaledFontSizePx * 0.18)}px #ffffff, 0 0 ${Math.max(10, scaledFontSizePx * 0.45)}px ${project.options.activeColor}, 0 0 ${Math.max(18, scaledFontSizePx * 0.8)}px ${project.options.outlineColor}, 0 1px 4px rgba(0,0,0,0.75)`,
+              }"
+            >
+              𝄞
+            </span>
+            <span
+              class="font-bold tracking-wide"
+              :style="{
+                fontFamily: `'Snell Roundhand', 'Brush Script MT', cursive`,
+                fontSize: `${scaledFontSizePx * 2.15}px`,
+                color: '#ffffff',
+                WebkitTextStroke: `${Math.max(0.6, scaledFontSizePx * 0.035)}px rgba(147, 197, 253, 0.7)`,
+                textShadow: `0 0 ${Math.max(4, scaledFontSizePx * 0.18)}px #ffffff, 0 0 ${Math.max(11, scaledFontSizePx * 0.48)}px ${project.options.activeColor}, 0 0 ${Math.max(20, scaledFontSizePx * 0.85)}px ${project.options.outlineColor}, 0 1px 6px rgba(0,0,0,0.8)`,
+              }"
+            >
+              KaraoCraft
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtle Outro Credit Watermark (5s before Outro Title/Artist fade-out, 2s in / 2s out at 50% opacity) -->
+      <div
+        v-if="outroWatermarkOpacity > 0"
+        class="absolute inset-x-0 bottom-[6%] flex justify-center px-4 text-center pointer-events-none select-none"
+        :style="{
+          opacity: outroWatermarkOpacity,
+          fontSize: `${Math.max(12, scaledFontSizePx * 0.56)}px`,
+          color: '#ffffff',
+          textShadow: '0 1px 4px rgba(0, 0, 0, 0.75)',
+        }"
+      >
+        {{ OUTRO_WATERMARK_TEXT }}
       </div>
 
       <!-- Lyrics Bounding Box (with optional 4-corner handles in Options mode) -->

@@ -12,10 +12,14 @@ import {
   parseRawLyrics,
 } from '../src/services/alignmentEngine.ts';
 import {
+  applyLyricsOffset,
   buildKaraokePresentationTimeline,
+  computeBackgroundImageOpacity,
+  computeOutroWatermarkOpacity,
   generateAssSubtitle,
   generateEnhancedLrc,
   hexToAssColor,
+  OUTRO_WATERMARK_TEXT,
   parseAndValidateProjectJson,
 } from '../src/services/subtitleExporter.ts';
 
@@ -277,6 +281,57 @@ describe('KaraoCraft Alignment & Subtitle Engine', () => {
     assert.ok(breakScheduled, 'Expected automatic --- Break --- line in 15.3s instrumental gap');
     assert.equal(breakScheduled.line.text, '------------ Break ------------');
     assert.ok(breakScheduled.displayStartSec >= 54.9 && breakScheduled.displayEndSec <= 66.8);
+
+    // 4. Background Image Opacity Curve Verification:
+    // - Intro (0s .. 27.6s): 1.0 (no fade-in)
+    assert.equal(computeBackgroundImageOpacity(0.0, tl, 85.0), 1.0);
+    assert.equal(computeBackgroundImageOpacity(15.0, tl, 85.0), 1.0);
+    assert.equal(computeBackgroundImageOpacity(27.6, tl, 85.0), 1.0);
+    // - Midpoint of 5s pre-lyric ramp (30.1s, halfway between 27.6s and 32.6s): 0.80
+    assert.equal(computeBackgroundImageOpacity(30.1, tl, 85.0), 0.8);
+    // - Exact moment first lyrics group starts sweeping (32.6s): exact 0.60
+    assert.equal(computeBackgroundImageOpacity(32.6, tl, 85.0), 0.6);
+    // - During lyrics and across short gap (32.6s .. 50.7s): 0.60
+    assert.equal(computeBackgroundImageOpacity(40.0, tl, 85.0), 0.6);
+    assert.equal(computeBackgroundImageOpacity(45.7, tl, 85.0), 0.6);
+    assert.equal(computeBackgroundImageOpacity(50.7, tl, 85.0), 0.6);
+    // - Long Break: starts ramping up 2s before last word of Frame 1 ends (52.7s - 2.0s = 50.7s)
+    //   and hits full 1.0 at 3s after last word ends (52.7s + 3.0s = 55.7s)
+    assert.equal(computeBackgroundImageOpacity(53.2, tl, 85.0), 0.8);
+    assert.equal(computeBackgroundImageOpacity(55.7, tl, 85.0), 1.0);
+    assert.equal(computeBackgroundImageOpacity(60.0, tl, 85.0), 1.0);
+    // - Long Break -> Next Lyrics Group (68.0s): starts ramping down at 63.0s (68.0s - 5.0s) and hits exact 0.60 at 68.0s
+    assert.equal(computeBackgroundImageOpacity(63.0, tl, 85.0), 1.0);
+    assert.equal(computeBackgroundImageOpacity(65.5, tl, 85.0), 0.8);
+    assert.equal(computeBackgroundImageOpacity(68.0, tl, 85.0), 0.6);
+    // - Outro: last word ends at 72.0s -> ramps up from 70.0s (72.0 - 2.0) to 1.0 at 75.0s (72.0 + 3.0)
+    assert.equal(computeBackgroundImageOpacity(70.0, tl, 85.0), 0.6);
+    assert.equal(computeBackgroundImageOpacity(72.5, tl, 85.0), 0.8);
+    assert.equal(computeBackgroundImageOpacity(75.0, tl, 85.0), 1.0);
+    // - Right after Outro Title/Artist card fades out (tl.outroCard.endSec), 3s fade-out to 0.0
+    const outroEnd = tl.outroCard!.endSec;
+    assert.equal(computeBackgroundImageOpacity(outroEnd, tl, 85.0), 1.0);
+    assert.equal(computeBackgroundImageOpacity(outroEnd + 1.5, tl, 85.0), 0.5);
+    assert.equal(computeBackgroundImageOpacity(outroEnd + 3.0, tl, 85.0), 0.0);
+
+    // 5. Global Lyrics Offset (-2.0s to +2.0s in 0.5s increments, non-destructive)
+    const delayed = applyLyricsOffset(lines, 1.5);
+    assert.equal(delayed[0].startSec, 34.1);
+    assert.equal(delayed[0].endSec, 36.8);
+    assert.equal(delayed[0].words[0].startSec, 34.1);
+    assert.equal(lines[0].startSec, 32.6, 'Original lines must remain untouched');
+
+    const earlier = applyLyricsOffset(lines, -2.0);
+    assert.equal(earlier[0].startSec, 30.6);
+    assert.equal(earlier[0].endSec, 33.3);
+
+    // 6. Outro Watermark (7s before outroCard.endSec, 2s fade-in, 3s hold at 50%, 2s fade-out)
+    assert.equal(computeOutroWatermarkOpacity(10.0, tl.outroCard), 0);
+    assert.equal(computeOutroWatermarkOpacity(outroEnd - 7.0, tl.outroCard), 0);
+    assert.equal(computeOutroWatermarkOpacity(outroEnd - 6.0, tl.outroCard), 0.25);
+    assert.equal(computeOutroWatermarkOpacity(outroEnd - 3.5, tl.outroCard), 0.5);
+    assert.equal(computeOutroWatermarkOpacity(outroEnd - 1.0, tl.outroCard), 0.25);
+    assert.equal(computeOutroWatermarkOpacity(outroEnd, tl.outroCard), 0);
   });
 
   it('generates valid ASS karaoke script and renders cleanly through FFmpeg libass', () => {
@@ -318,6 +373,37 @@ describe('KaraoCraft Alignment & Subtitle Engine', () => {
     const bs = String.fromCharCode(92);
     assert.ok(ass.includes(`${bs}kf`), 'ASS output must contain \kf karaoke sweep tags');
     assert.ok(ass.includes(`${bs}pos(`), 'ASS output must contain \pos positioning tags');
+
+    const assWithBg = generateAssSubtitle({
+      title: 'Second Love',
+      artist: 'Takao Kisugi',
+      lines: aligned,
+      options: {
+        aspectRatio: '4:3',
+        bgColor: '#000000',
+        textSize: 32,
+        activeColor: '#3dbeff',
+        unsungColor: '#ffffff',
+        outlineColor: '#004bfa',
+        bold: true,
+        outline: true,
+        hCenter: true,
+        vCenter: true,
+        linesPerFrame: 4,
+        boxLeft: 0.07,
+        boxTop: 0.21,
+        boxWidth: 0.86,
+        boxHeight: 0.58,
+      },
+      durationSec: 4,
+      quality: '720p',
+      hasBackgroundImage: true,
+    });
+    assert.ok(assWithBg.includes('Style: BgDimmer'), 'ASS with background image must define BgDimmer style');
+    assert.ok(assWithBg.includes('Style: CreditWatermark'), 'ASS must define CreditWatermark style');
+    assert.ok(assWithBg.includes('Dialogue: 0,0:00:00.00'), 'ASS with background image must emit Layer 0 BgDimmer');
+    assert.ok(assWithBg.includes('Dialogue: 1,'), 'ASS with background image must place lyrics on Layer 1');
+    assert.ok(!assWithBg.includes(`${OUTRO_WATERMARK_TEXT}`), 'Short 4s test clip has no Outro card, so no watermark');
 
     const lrc = generateEnhancedLrc({
       title: 'Second Love',
