@@ -8,34 +8,29 @@ KaraoCraft brings modern, local-first karaoke creation to your desktop. Inspired
 
 ## 🌟 Key Features
 
-### 1. Local AI Alignment & Audio Engine
-* **Local Whisper AI Alignment:** Automatically transcribes and extracts exact word-level start/end timestamps from vocal stems using OpenAI Whisper or MLX-Whisper.
-* **Needleman-Wunsch Sequence Alignment:** Matches user-supplied formatted lyrics against Whisper speech tokens using dynamic programming, preserving custom capitalization, punctuation, and stanza breaks.
-* **Built-in Vocal Waveform Aligner (Fallback):** Decodes RMS audio energy into non-silent vocal "islands" so musical intros, solos, and instrumental interludes are automatically respected even without AI.
-* **Dual-Stem Audio Engine:** Independent playback, gain, and mute controls for isolated vocal stems and instrumental backing tracks via Web Audio API.
+### 1. Local AI Phonetic Forced Alignment & Audio Engine
+* **Phonetic Forced Alignment (`MMS_FA` + `uroman` + `pykakasi`):** Uses Meta's Massively Multilingual Speech CTC forced aligner (`torchaudio.pipelines.MMS_FA`) on Apple Silicon GPU (`mps`) / CPU with universal phonetic transliteration (`uroman` & Japanese `pykakasi`) and vocal-sustain tail extension for ~95% word-level accuracy—even on Romaji lyrics for Japanese songs.
+* **Whisper + Needleman-Wunsch & Vocal Waveform Fallbacks:** Automatically falls back to OpenAI Whisper / MLX-Whisper DP sequence alignment or built-in RMS vocal-island detection if `torchaudio` is not installed.
+* **Sample-Accurate Web Audio Dual-Stem Engine:** Plays decoded vocal and instrumental `AudioBuffer`s with zero drift, independent mix modes (`Instrumental Only`, `Guide Mix`, `Vocal Stem Only`), and `0.5x–1.5x` speed control—even when reloading projects from `.json`.
 
-### 2. Studio Workflow Tabs
-* **Basics Tab:**
-  * Drag-and-drop dual-stem intake (vocal track + backing track).
-  * Song Title and Artist metadata configuration.
-  * Multilingual lyrics editor with auto-sanitization (strips `[Verse]`/`[Chorus]` tags, smart quote normalizer, stanza preservation).
+### 2. Project Workflow & Studio Tabs
+* **Native Project Save & Open (`.json`):**
+  * **New / Open / Save / Save As (`⌘S` / `⇧⌘S`):** Start fresh, open existing `.json` projects (with validation for non-KaraoCraft JSON files), or save in-place without creating duplicate copies.
+  * **Smart Path Linking:** Stores references to your vocal and instrumental audio files without copying or moving them, and remembers your audio and project folders separately.
+* **Setup & Basics Tab:**
+  * Drag-and-drop or native audio stem picker, Title/Artist metadata, and quick lyric formatting tools (**Sentence case**, **Uppercase**, and **Remove `[Tags]`**).
 * **Options Tab:**
-  * **Interactive 4-Corner Bounding Box:** Drag white corner handles directly on the 16:9 stage preview to resize lyrics margins, line widths, and vertical slot heights.
+  * **Interactive 4-Corner Bounding Box:** Drag white corner handles directly on the stage preview to resize lyrics margins, line widths, and vertical slot heights.
   * **Layout Controls:** Horizontal & Vertical centering toggles, lines-per-frame pagination (2, 3, 4, etc.).
-  * **Typography & Palette:** Font size, weight, font family (includes full CJK presets for Japanese Kanji/Kana), sung/unsung wipe colors, outline thickness, and background color.
-* **Line Timings Tab:**
-  * Line-by-line start and end adjustments with real-time waveform scrubbers.
-  * Frame boundary markers showing screen group pagination.
-  * **Resync Words Modal:** Easily re-align syllable timings within customized line bounds proportionally or to vocal energy peaks.
-* **Word Timings Tab:**
-  * Syllable and word-level precision timing editor.
-  * Inline micro-adjusters (`-0.05s` / `+0.05s`) for rapid fine-tuning.
-  * Interactive playhead previewing exact character sweep wipes.
-* **Video Export Tab:**
-  * One-click rendering of full HD **1080p 60fps MP4** karaoke videos baked with FFmpeg hardware encoding and `libass`.
-  * Advanced **ASS Karaoke Subtitles** (`.ass`) with calculated screen display intervals and progressive `\kf` karaoke fill tags.
-  * Standard subtitle and lyric exports: **Enhanced LRC** (`.lrc`), **WebVTT** (`.vtt`), and **SRT** (`.srt`).
-  * Self-contained `.karaocraft` JSON project save and load.
+  * **Typography & Palette:** Font size, weight, sung/unsung wipe colors, outline thickness, and background color.
+* **Line Timings & Word Timings Tabs:**
+  * Line-by-line and word-by-word adjustments with real-time waveform scrubbers, Tap Sync (`T`), inline `-0.05s` / `+0.05s` micro-adjusters, and **Resync Modal**.
+* **Broadcast Karaoke Transitions & Video Export Tab:**
+  * **3-Second Lyric Lead-In & Lookahead:** Incoming lyric frames (or Slot 0 lookahead on tight transitions) appear 3 seconds before their first sung word so singers always have time to read ahead.
+  * **Automatic `------------ Break ------------` Banners:** Auto-inserted across long instrumental gaps (`>= 8.0s`) with a progressive sweep countdown.
+  * **Moderate-Gap Hold & Smooth Fades:** Retains lyric frames for ~2 seconds on moderate pauses and applies `250ms` fade-in / `300ms` fade-out transitions in both live preview and `.ass` / MP4 output.
+  * **Intro & Outro Title/Artist Cards:** Automatically scheduled before the first lyric frame and after the final lyric frame.
+  * **One-Click MP4 & Subtitle Export:** Hardware-accelerated H.264 (`h264_videotoolbox`) MP4 rendering via FFmpeg + `libass`, plus `.ass`, Enhanced `.lrc`, and `.json` project export.
 
 ---
 
@@ -47,22 +42,22 @@ KaraoCraft brings modern, local-first karaoke creation to your desktop. Inspired
 | **Node.js** | Frontend tooling | `v20.x` or `v22.x` (`brew install node`) |
 | **Rust & Cargo** | Tauri native backend | `v1.80+` (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh`) |
 | **FFmpeg with libass** | MP4 video baking & subtitle burn-in | `brew install ffmpeg` (verify with `ffmpeg -version`) |
-| **Whisper CLI** | Syllable & word AI alignment | `pipx install --python python3.10 openai-whisper` (see below) |
+| **Whisper / MMS_FA** | Phonetic forced alignment (`torchaudio`, `uroman`, `pykakasi`) & Whisper fallback | `pipx install --python python3.10 openai-whisper` + `pip install torchaudio uroman pykakasi` |
 
-### Installing Whisper for Syllable Alignment
+### Installing Phonetic Forced Alignment (`MMS_FA`) & Whisper
 
-To enable local AI word-level alignment, install OpenAI Whisper so it is accessible in your `$PATH` or `~/.local/bin/whisper`:
+To enable Apple Silicon GPU-accelerated phonetic forced alignment (`MMS_FA`) and Whisper fallback, install them into your `openai-whisper` pipx environment:
 
 ```bash
-# Recommended: Install via pipx using Python 3.10 / 3.11 / 3.12
+# 1. Install OpenAI Whisper via pipx
 pipx install --python /opt/homebrew/bin/python3.10 openai-whisper
 
-# Or using pip directly:
-pip3 install openai-whisper
+# 2. Add torchaudio + universal phonetic transliteration (uroman & pykakasi)
+~/.local/pipx/venvs/openai-whisper/bin/python -m pip install torchaudio uroman pykakasi
 ```
 
 > [!TIP]
-> KaraoCraft auto-detects `whisper` and `mlx_whisper` on startup. On Apple Silicon Macs, KaraoCraft runs Whisper in FP32 CPU/Metal mode using the fast `base` model.
+> KaraoCraft auto-detects `torchaudio` + `uroman` (for `MMS_FA` forced alignment on Apple Silicon `mps`/CPU) and falls back to `mlx_whisper` / `whisper` if unavailable.
 
 ---
 

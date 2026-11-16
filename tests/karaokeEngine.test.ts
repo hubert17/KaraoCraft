@@ -248,27 +248,29 @@ describe('KaraoCraft Alignment & Subtitle Engine', () => {
     assert.ok(tl.introCard, 'Expected Intro Title/Artist card before 32.6s');
     assert.ok(tl.outroCard, 'Expected Outro Title/Artist card after 72.0s');
 
-    // 2a. Before the last word ('utsumuku' / 'dake' at t=41.0s), original Slot 0 ('anata no se-eta') is still intact!
+    // 2a. More than 3.0s before 'kaeritaku nai' (45.7s - 3.0s = 42.7s), e.g. at t=41.0s,
+    // original Slot 0 ('anata no se-eta') is still intact and 'kaeritaku nai' has not appeared yet!
     const visibleAt41 = tl.scheduledLines.filter(
       (s) => 41.0 >= s.displayStartSec && 41.0 <= s.displayEndSec
     );
     const textsAt41 = visibleAt41.map((s) => s.line.text);
-    assert.ok(textsAt41.includes('anata no se-eta'), 'First line should still be shown before the last word starts');
-    assert.ok(!textsAt41.includes('kaeritaku nai'), 'Lookahead line should NOT appear before the last word starts');
+    assert.ok(textsAt41.includes('anata no se-eta'), 'First line should still be shown >3.0s before next stanza');
+    assert.ok(!textsAt41.includes('kaeritaku nai'), 'Lookahead line should NOT appear >3.0s before next stanza');
 
-    // 2b. During the last word ('nante' at t=42.8s), Slot 0 swaps to 'kaeritaku nai' with zero slot collision!
-    const visibleAt428 = tl.scheduledLines.filter(
-      (s) => 42.8 >= s.displayStartSec && 42.8 <= s.displayEndSec
+    // 2b. Within 3.0s before 'kaeritaku nai' (at t=43.0s, since 45.7s - 3.0s = 42.7s),
+    // Slot 0 swaps to 'kaeritaku nai' with zero slot collision!
+    const visibleAt43 = tl.scheduledLines.filter(
+      (s) => 43.0 >= s.displayStartSec && 43.0 <= s.displayEndSec
     );
-    const textsAt428 = visibleAt428.map((s) => s.line.text);
-    assert.ok(!textsAt428.includes('anata no se-eta'), 'First line should have swapped out at 42.25s');
+    const textsAt43 = visibleAt43.map((s) => s.line.text);
+    assert.ok(!textsAt43.includes('anata no se-eta'), 'First line should have swapped out at 42.7s (45.7s - 3.0s)');
     assert.ok(
-      textsAt428.includes('kaeritaku nai'),
-      'Next stanza first line (kaeritaku nai) should be visible in Slot 0 during last word'
+      textsAt43.includes('kaeritaku nai'),
+      'Next stanza first line (kaeritaku nai) should be visible in Slot 0 at 45.7s - 3.0s'
     );
-    assert.ok(textsAt428.includes('utsumuku dake nante'));
-    const slotsAt428 = new Set(visibleAt428.map((s) => s.slotIndex));
-    assert.equal(slotsAt428.size, visibleAt428.length, 'No two visible lines may share the same slotIndex');
+    assert.ok(textsAt43.includes('utsumuku dake nante'));
+    const slotsAt43 = new Set(visibleAt43.map((s) => s.slotIndex));
+    assert.equal(slotsAt43.size, visibleAt43.length, 'No two visible lines may share the same slotIndex');
 
     // 3. Long gap (52.7s -> 68.0s): Frame 1 holds for ~2.0s (until 54.7s), then --- Break --- appears!
     const breakScheduled = tl.scheduledLines.find((s) => s.isBreak);

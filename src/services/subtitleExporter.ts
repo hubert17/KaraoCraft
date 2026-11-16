@@ -104,7 +104,7 @@ export interface KaraokePresentationTimeline {
 }
 
 const BREAK_GAP_THRESHOLD_SEC = 8.0;
-const LOOKAHEAD_MAX_GAP_SEC = 6.5;
+const INCOMING_LEAD_IN_SEC = 3.0;
 const DEFAULT_FADE_IN_SEC = 0.25;
 const DEFAULT_FADE_OUT_SEC = 0.3;
 
@@ -187,14 +187,14 @@ export function buildFrameGroups(lines: AlignedLyricLine[], durationSec: number)
     };
   });
 
-  // Compute smooth pre-roll and extended post-hold (~2.0s on moderate gaps)
+  // Compute smooth 3.0s pre-roll and extended post-hold (~2.0s on moderate gaps)
   for (let i = 0; i < rawGroups.length; i++) {
     const cur = rawGroups[i];
     const prevEnd = i > 0 ? rawGroups[i - 1].displayEndSec : 0;
     const nextStart =
       i < rawGroups.length - 1 ? rawGroups[i + 1].startSec : Math.max(durationSec, cur.endSec + 2.5);
 
-    const idealLeadIn = Math.max(prevEnd + 0.12, cur.startSec - 1.1);
+    const idealLeadIn = Math.max(prevEnd + 0.12, cur.startSec - INCOMING_LEAD_IN_SEC);
     cur.displayStartSec = Number(Math.min(cur.startSec, idealLeadIn).toFixed(3));
 
     const gapToNext = nextStart - cur.endSec;
@@ -202,11 +202,12 @@ export function buildFrameGroups(lines: AlignedLyricLine[], durationSec: number)
     if (gapToNext >= BREAK_GAP_THRESHOLD_SEC) {
       // Hold for ~2.0s before fading out into the --- Break --- banner
       hold = 2.0;
-    } else if (gapToNext >= 2.6) {
-      // Moderate gap: retain lyrics set for ~2.0-2.2s before fading out
-      hold = Math.min(2.2, gapToNext - 1.0);
+    } else if (gapToNext >= INCOMING_LEAD_IN_SEC + 0.6) {
+      // Enough room for the next group's 3.0s lead-in PLUS a post-hold on the current group (up to 2.2s)
+      hold = Math.min(2.2, gapToNext - INCOMING_LEAD_IN_SEC - 0.15);
     } else if (gapToNext > 1.2) {
-      hold = Math.min(1.4, gapToNext * 0.6);
+      // Tight gap (< 3.6s): brief post-hold while Slot 0 lookahead previews the incoming line 3.0s early
+      hold = Math.min(0.65, gapToNext * 0.35);
     } else {
       hold = Math.max(0.08, gapToNext * 0.45);
     }
@@ -279,9 +280,9 @@ export function buildKaraokePresentationTimeline(params: {
     }
   }
 
-  // 2. Build per-line scheduled display windows with Rolling Slot Lookahead
-  // When singing the LAST WORD of the last line of group i (and group i+1 is a normal lyric stanza within LOOKAHEAD_MAX_GAP_SEC),
-  // Slot 0 of group i swaps to Line 0 of group i+1 so the singer sees the upcoming line right as they finish the last word.
+  // 2. Build per-line scheduled display windows with 3.0-Second Lookahead Rule:
+  // Every incoming lyric group (or its Slot 0 lookahead line when the gap is < 3.0s) appears 3.0 seconds
+  // before the start of that incoming lyric (`next.startSec - 3.0`).
   const lookaheadSwapTimeForGroup = new Map<number, number>();
   for (let i = 0; i < groups.length - 1; i++) {
     const cur = groups[i];
@@ -289,15 +290,11 @@ export function buildKaraokePresentationTimeline(params: {
     if (cur.isBreak || next.isBreak) continue;
     if (cur.lines.length < 2 || next.lines.length === 0) continue;
 
-    const gap = next.startSec - cur.endSec;
-    if (gap <= LOOKAHEAD_MAX_GAP_SEC) {
+    const targetLookaheadSec = next.startSec - INCOMING_LEAD_IN_SEC;
+    // If 3.0s before next.startSec falls while cur is still on screen, swap Slot 0 at next.startSec - 3.0s
+    if (targetLookaheadSec < next.displayStartSec - 0.1) {
       const firstLineEnd = cur.lines[0].endSec;
-      const lastLine = cur.lines[cur.lines.length - 1];
-      const lastWord = lastLine.words[lastLine.words.length - 1];
-      const lastWordStart = lastWord ? lastWord.startSec : lastLine.startSec;
-
-      const swapSec = Number(Math.max(firstLineEnd + 0.35, lastWordStart).toFixed(3));
-      // Only trigger lookahead if swapSec is strictly before cur.displayEndSec and next.displayStartSec
+      const swapSec = Number(Math.max(firstLineEnd + 0.35, targetLookaheadSec).toFixed(3));
       if (swapSec < cur.displayEndSec - 0.15 && swapSec < next.displayStartSec - 0.1) {
         lookaheadSwapTimeForGroup.set(i, swapSec);
       }
