@@ -34,7 +34,20 @@ KaraoCraft brings modern, local-first karaoke creation to your desktop. Inspired
 
 ---
 
-## 📋 System Requirements & Prerequisites
+## 📦 Download & Install (macOS Apple Silicon)
+
+1. Download the latest **`KaraoCraft_x.y.z_aarch64.dmg`** from [GitHub Releases](https://github.com/hubert17/KaraoCraft/releases) and drag **KaraoCraft.app** into your `/Applications` folder.
+2. **Clear macOS Quarantine (Required Once for Unsigned Builds):**
+   Because the release build is not notarized with an Apple Developer ID certificate, macOS Gatekeeper will show *"KaraoCraft is damaged and can't be opened"* when downloaded via Chrome or Safari. Run this once in Terminal before launching:
+   ```bash
+   xattr -cr /Applications/KaraoCraft.app
+   ```
+3. **One-Click First-Run Setup:**
+   On first launch, KaraoCraft automatically checks for **FFmpeg** and the **AI Phonetic Aligner (`MMS_FA`)** and offers to download and configure them with one click—no manual Python or Homebrew setup required.
+
+---
+
+## 📋 System Requirements & Prerequisites (For Development)
 
 | Requirement | Purpose | Recommended Installation |
 | :--- | :--- | :--- |

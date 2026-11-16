@@ -48,7 +48,8 @@ jobs:
 
             ### 📦 Installation (macOS)
             1. Download **`KaraoCraft_0.2.0_aarch64.dmg`** below and drag **KaraoCraft.app** into your `/Applications` folder.
-            2. **First Launch (Unsigned Build Note):** If macOS Gatekeeper shows a warning, right-click **KaraoCraft.app** → **Open**, or run once in Terminal:
+            2. **Clear macOS Quarantine (Required Once for Unsigned Builds):**
+               Because this release is not signed with an Apple Developer ID certificate, macOS Gatekeeper will report *"KaraoCraft is damaged and can't be opened"* when downloaded via Chrome/Safari. Run this command once in Terminal:
                ```bash
                xattr -cr /Applications/KaraoCraft.app
                ```
