@@ -47,9 +47,9 @@ jobs:
             ## 🎤 KaraoCraft ${{ github.ref_name }} — macOS Apple Silicon Release
 
             ### 📦 Installation (macOS)
-            1. Download **`KaraoCraft_0.2.1_aarch64.dmg`** below and drag **KaraoCraft.app** into your `/Applications` folder.
-            2. **Clear macOS Quarantine (Required Once for Unsigned Builds):**
-               Because this release is not signed with an Apple Developer ID certificate, macOS Gatekeeper will report *"KaraoCraft is damaged and can't be opened"* when downloaded via Chrome/Safari. Run this command once in Terminal:
+            1. Download the **`.dmg`** asset below (`KaraoCraft_*_aarch64.dmg`) and drag **KaraoCraft.app** into your `/Applications` folder.
+            2. **Clear macOS Gatekeeper Quarantine (Required Once):**
+               Because this release is not notarized with a paid Apple Developer ID certificate, macOS Gatekeeper will report *"KaraoCraft is damaged and can't be opened"* when downloaded via a browser. Run this command once in **Terminal**:
                ```bash
                xattr -cr /Applications/KaraoCraft.app
                ```

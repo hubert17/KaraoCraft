@@ -26,10 +26,12 @@ KaraoCraft brings modern, local-first karaoke creation to your desktop. Inspired
 * **Line Timings & Word Timings Tabs:**
   * Line-by-line and word-by-word adjustments with real-time waveform scrubbers, Tap Sync (`T`), inline `-0.05s` / `+0.05s` micro-adjusters, and **Resync Modal**.
 * **Broadcast Karaoke Transitions & Video Export Tab:**
+  * **Dynamic Background Image:** Attach an optional background image (aspect-ratio-filled with no black bars) that starts at `100%` opacity in the Intro, dims to `40%` 5 seconds before lyrics begin so text pops, brightens back to `100%` across long instrumental breaks and the Outro, and fades out over 3 seconds after the Outro card.
+  * **Global Lyrics Offset (`-2.0s` to `+2.0s`):** Non-destructively shift all lyrics earlier or later in `0.5s` increments right from the Video tab.
   * **3-Second Lyric Lead-In & Lookahead:** Incoming lyric frames (or Slot 0 lookahead on tight transitions) appear 3 seconds before their first sung word so singers always have time to read ahead.
   * **Automatic `------------ Break ------------` Banners:** Auto-inserted across long instrumental gaps (`>= 8.0s`) with a progressive sweep countdown.
   * **Moderate-Gap Hold & Smooth Fades:** Retains lyric frames for ~2 seconds on moderate pauses and applies `250ms` fade-in / `300ms` fade-out transitions in both live preview and `.ass` / MP4 output.
-  * **Intro & Outro Title/Artist Cards:** Automatically scheduled before the first lyric frame and after the final lyric frame.
+  * **Intro Musical Staff Branding & Outro Cards:** Auto-scheduled Intro card (starting immediately at frame 0 with glowing `𝄞 KaraoCraft` pentagram branding) and Outro card with a subtle `7s` closing watermark.
   * **One-Click MP4 & Subtitle Export:** Hardware-accelerated H.264 (`h264_videotoolbox`) MP4 rendering via FFmpeg + `libass`, plus `.ass`, Enhanced `.lrc`, and `.json` project export.
 
 ---
@@ -37,12 +39,19 @@ KaraoCraft brings modern, local-first karaoke creation to your desktop. Inspired
 ## 📦 Download & Install (macOS Apple Silicon)
 
 1. Download the latest **`KaraoCraft_x.y.z_aarch64.dmg`** from [GitHub Releases](https://github.com/hubert17/KaraoCraft/releases) and drag **KaraoCraft.app** into your `/Applications` folder.
-2. **Clear macOS Quarantine (Required Once for Unsigned Builds):**
-   Because the release build is not notarized with an Apple Developer ID certificate, macOS Gatekeeper will show *"KaraoCraft is damaged and can't be opened"* when downloaded via Chrome or Safari. Run this once in Terminal before launching:
-   ```bash
-   xattr -cr /Applications/KaraoCraft.app
-   ```
-3. **One-Click First-Run Setup:**
+
+> [!IMPORTANT]
+> **macOS Gatekeeper Notice (Required Once Before First Launch)**
+>
+> Because KaraoCraft is currently distributed without a paid Apple Developer ID notarization, macOS Gatekeeper will block the app after downloading via a browser with *"KaraoCraft is damaged and can't be opened. You should move it to the Trash."*
+>
+> Run this command **once** in **Terminal** to clear the macOS quarantine attribute:
+> ```bash
+> xattr -cr /Applications/KaraoCraft.app
+> ```
+> After running this once, KaraoCraft will open normally from Applications or Spotlight.
+
+2. **One-Click First-Run Setup:**
    On first launch, KaraoCraft automatically checks for **FFmpeg** and the **AI Phonetic Aligner (`MMS_FA`)** and offers to download and configure them with one click—no manual Python or Homebrew setup required.
 
 ---
