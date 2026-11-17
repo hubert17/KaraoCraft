@@ -1,9 +1,42 @@
 <script setup lang="ts">
+import { ref, onMounted, onUnmounted } from 'vue';
 import { useProjectStore } from '../stores/projectStore';
 import KaraokeRenderer from './KaraokeRenderer.vue';
 import { Minus, Plus } from '@lucide/vue';
 
 const project = useProjectStore();
+
+const pageRef = ref<HTMLDivElement | null>(null);
+const belowVideoRef = ref<HTMLDivElement | null>(null);
+const previewMaxHeightPx = ref(270);
+let resizeObserver: ResizeObserver | null = null;
+
+function recalcPreviewHeight() {
+  if (!pageRef.value || !belowVideoRef.value) return;
+  const pageH = pageRef.value.clientHeight;
+  const belowH = belowVideoRef.value.offsetHeight;
+  // Account for vertical padding (py-5 -> 40px) + gap between preview & bottom controls (20px)
+  const available = pageH - belowH - 60;
+  previewMaxHeightPx.value = Math.max(190, Math.floor(available));
+}
+
+onMounted(() => {
+  recalcPreviewHeight();
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => recalcPreviewHeight());
+    if (pageRef.value) resizeObserver.observe(pageRef.value);
+    if (belowVideoRef.value) resizeObserver.observe(belowVideoRef.value);
+  }
+});
+
+onUnmounted(() => {
+  resizeObserver?.disconnect();
+});
+
+function setAspectRatio(ratio: '4:3' | '16:9') {
+  project.options.aspectRatio = ratio;
+  project.options.textSize = ratio === '16:9' ? 40 : 32;
+}
 
 function adjustTextSize(delta: number) {
   const next = Math.max(16, Math.min(64, project.options.textSize + delta));
@@ -41,14 +74,17 @@ function applyPreset(preset: 'croonify' | 'gold' | 'magenta' | 'emerald' | 'crim
 </script>
 
 <template>
-  <div class="h-full overflow-y-auto bg-white px-8 py-6">
-    <div class="max-w-5xl mx-auto space-y-6">
-      <!-- Top Interactive Preview Stage + 4-Corner Bounding Box Controls -->
+  <div ref="pageRef" class="h-full overflow-y-auto bg-white px-8 py-5">
+    <div class="max-w-5xl mx-auto flex flex-col gap-5">
+      <!-- Top Interactive Preview Stage (scales proportionally with available window height) -->
       <div class="flex flex-col items-center">
-        <KaraokeRenderer :editable-box="true" :max-height-px="270" />
+        <KaraokeRenderer :editable-box="true" :max-height-px="previewMaxHeightPx" />
+      </div>
 
+      <!-- Controls & Options Cards (kept visible below the dynamically resized video panel) -->
+      <div ref="belowVideoRef" class="space-y-4">
         <!-- H-Center & V-Center Checkboxes (Slides 3, 4, 5) -->
-        <div class="mt-3.5 flex flex-wrap items-center justify-center gap-6 text-base font-semibold text-slate-800">
+        <div class="flex flex-wrap items-center justify-center gap-6 text-base font-semibold text-slate-800">
           <label class="inline-flex items-center gap-2 cursor-pointer select-none">
             <input
               type="checkbox"
@@ -73,47 +109,46 @@ function applyPreset(preset: 'croonify' | 'gold' | 'magenta' | 'emerald' | 'crim
             Drag the 4 white circles on the preview screen to adjust lyrics width & line spacing
           </span>
         </div>
-      </div>
 
-      <!-- Streamlined Single-View Options Cards (Combining Video, Text & Frames!) -->
-      <div class="border border-slate-200 rounded-2xl bg-slate-50/60 p-5">
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
-          <!-- Card 1: Screen & Frame Layout -->
-          <div class="bg-white rounded-2xl shadow-card border border-slate-200/90 p-5 space-y-5">
-            <h3 class="text-lg font-bold text-slate-900 border-b border-slate-100 pb-2">
-              Screen & Frames
-            </h3>
+        <!-- Streamlined Single-View Options Cards (Combining Video, Text & Frames!) -->
+        <div class="border border-slate-200 rounded-2xl bg-slate-50/60 p-5">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+            <!-- Card 1: Screen & Frame Layout -->
+            <div class="bg-white rounded-2xl shadow-card border border-slate-200/90 p-5 space-y-5">
+              <h3 class="text-lg font-bold text-slate-900 border-b border-slate-100 pb-2">
+                Screen & Frames
+              </h3>
 
-            <!-- Aspect Ratio -->
-            <div class="flex items-center justify-between gap-3">
-              <span class="text-base font-medium text-slate-800">Aspect</span>
-              <div class="inline-flex rounded-xl bg-slate-200/80 p-1">
-                <button
-                  type="button"
-                  @click="project.options.aspectRatio = '4:3'"
-                  class="px-4 py-1.5 rounded-lg text-base font-semibold transition-all"
-                  :class="
-                    project.options.aspectRatio === '4:3'
-                      ? 'bg-brand-purple text-white shadow-xs'
-                      : 'text-slate-700 hover:text-slate-950'
-                  "
-                >
-                  4:3
-                </button>
-                <button
-                  type="button"
-                  @click="project.options.aspectRatio = '16:9'"
-                  class="px-4 py-1.5 rounded-lg text-base font-semibold transition-all"
-                  :class="
-                    project.options.aspectRatio === '16:9'
-                      ? 'bg-brand-purple text-white shadow-xs'
-                      : 'text-slate-700 hover:text-slate-950'
-                  "
-                >
-                  16:9
-                </button>
+              <!-- Aspect Ratio -->
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-base font-medium text-slate-800">Aspect</span>
+                <div class="inline-flex rounded-xl bg-slate-200/80 p-1">
+                  <button
+                    type="button"
+                    @click="setAspectRatio('4:3')"
+                    class="px-4 py-1.5 rounded-lg text-base font-semibold transition-all"
+                    :class="
+                      project.options.aspectRatio === '4:3'
+                        ? 'bg-brand-purple text-white shadow-xs'
+                        : 'text-slate-700 hover:text-slate-950'
+                    "
+                  >
+                    4:3
+                  </button>
+                  <button
+                    type="button"
+                    @click="setAspectRatio('16:9')"
+                    class="px-4 py-1.5 rounded-lg text-base font-semibold transition-all"
+                    :class="
+                      project.options.aspectRatio === '16:9'
+                        ? 'bg-brand-purple text-white shadow-xs'
+                        : 'text-slate-700 hover:text-slate-950'
+                    "
+                  >
+                    16:9
+                  </button>
+                </div>
               </div>
-            </div>
 
             <!-- Lines per Frame -->
             <div class="flex items-center justify-between gap-3">
@@ -326,6 +361,7 @@ function applyPreset(preset: 'croonify' | 'gold' | 'magenta' | 'emerald' | 'crim
             </div>
           </div>
         </div>
+      </div>
       </div>
     </div>
   </div>

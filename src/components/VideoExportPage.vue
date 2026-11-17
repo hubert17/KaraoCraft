@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { ref, watch, onMounted, onUnmounted } from 'vue';
 import { useProjectStore } from '../stores/projectStore';
 import KaraokeRenderer from './KaraokeRenderer.vue';
 import {
@@ -20,6 +20,36 @@ import {
 } from '@lucide/vue';
 
 const project = useProjectStore();
+
+const pageRef = ref<HTMLDivElement | null>(null);
+const transportControlsRef = ref<HTMLDivElement | null>(null);
+const bottomCardsRef = ref<HTMLDivElement | null>(null);
+const previewMaxHeightPx = ref(300);
+let resizeObserver: ResizeObserver | null = null;
+
+function recalcPreviewHeight() {
+  if (!pageRef.value || !transportControlsRef.value || !bottomCardsRef.value) return;
+  const pageH = pageRef.value.clientHeight;
+  const transportH = transportControlsRef.value.offsetHeight;
+  const bottomH = bottomCardsRef.value.offsetHeight;
+  // Account for py-5 (40px), gap (16px), player box padding/border (34px), and transport mt-3 (12px)
+  const available = pageH - transportH - bottomH - 102;
+  previewMaxHeightPx.value = Math.max(185, Math.floor(available));
+}
+
+onMounted(() => {
+  recalcPreviewHeight();
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => recalcPreviewHeight());
+    if (pageRef.value) resizeObserver.observe(pageRef.value);
+    if (transportControlsRef.value) resizeObserver.observe(transportControlsRef.value);
+    if (bottomCardsRef.value) resizeObserver.observe(bottomCardsRef.value);
+  }
+});
+
+onUnmounted(() => {
+  resizeObserver?.disconnect();
+});
 
 const instInputRef = ref<HTMLInputElement | null>(null);
 const bgImageInputRef = ref<HTMLInputElement | null>(null);
@@ -88,14 +118,14 @@ function onBgImageSelect(e: Event) {
 </script>
 
 <template>
-  <div class="h-full overflow-y-auto bg-white px-8 py-6">
-    <div class="max-w-5xl mx-auto space-y-6">
+  <div ref="pageRef" class="h-full overflow-y-auto bg-white px-8 py-5">
+    <div class="max-w-5xl mx-auto space-y-4">
       <!-- 1. Live Synchronized Karaoke Video Player -->
-      <div class="bg-slate-50 border border-slate-200 rounded-2xl p-5 flex flex-col items-center">
-        <KaraokeRenderer :editable-box="false" :max-height-px="330" />
+      <div class="bg-slate-50 border border-slate-200 rounded-2xl p-4 flex flex-col items-center">
+        <KaraokeRenderer :editable-box="false" :max-height-px="previewMaxHeightPx" />
 
         <!-- Player Scrubber & Transport Controls -->
-        <div class="w-full max-w-2xl mt-4 space-y-3">
+        <div ref="transportControlsRef" class="w-full max-w-2xl mt-3 space-y-2.5">
           <div class="flex items-center gap-3">
             <button
               type="button"
@@ -280,9 +310,9 @@ function onBgImageSelect(e: Event) {
       </div>
 
       <!-- 2. Backing Track & Export Cards -->
-      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      <div ref="bottomCardsRef" class="grid grid-cols-1 lg:grid-cols-12 gap-5">
         <!-- Attach UVR Instrumental Backing Track -->
-        <div class="lg:col-span-5 bg-white rounded-2xl shadow-card border border-slate-200 p-6 flex flex-col justify-between space-y-4">
+        <div class="lg:col-span-5 bg-white rounded-2xl shadow-card border border-slate-200 p-5 flex flex-col justify-between space-y-3.5">
           <div class="space-y-2">
             <div class="flex items-center gap-2 text-lg font-bold text-slate-900">
               <Music class="w-5 h-5 text-brand-purple" />
@@ -341,7 +371,7 @@ function onBgImageSelect(e: Event) {
         </div>
 
         <!-- Render MP4 & Download Subtitles -->
-        <div class="lg:col-span-7 bg-white rounded-2xl shadow-card border border-slate-200 p-6 space-y-5">
+        <div class="lg:col-span-7 bg-white rounded-2xl shadow-card border border-slate-200 p-5 space-y-4">
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-2 text-lg font-bold text-slate-900">
               <Film class="w-5 h-5 text-brand-purple" />

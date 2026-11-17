@@ -24,6 +24,8 @@ const props = withDefaults(
 );
 
 const project = useProjectStore();
+const wrapRef = ref<HTMLDivElement | null>(null);
+const wrapWidthPx = ref(960);
 const stageRef = ref<HTMLDivElement | null>(null);
 const stageWidthPx = ref(480);
 const stageHeightPx = ref(360);
@@ -32,16 +34,27 @@ const isDraggingCorner = ref<string | null>(null);
 let resizeObserver: ResizeObserver | null = null;
 
 function measureStage() {
-  if (!stageRef.value) return;
-  stageWidthPx.value = stageRef.value.clientWidth || 480;
-  stageHeightPx.value = stageRef.value.clientHeight || 360;
+  if (wrapRef.value) {
+    wrapWidthPx.value = wrapRef.value.clientWidth || 960;
+  }
+  if (stageRef.value) {
+    stageWidthPx.value = stageRef.value.clientWidth || 480;
+    stageHeightPx.value = stageRef.value.clientHeight || 360;
+  }
 }
+
+const effectiveStageHeightPx = computed(() => {
+  const ratio = project.options.aspectRatio === '4:3' ? 4 / 3 : 16 / 9;
+  const maxByWidth = wrapWidthPx.value / ratio;
+  return Math.max(150, Math.floor(Math.min(props.maxHeightPx, maxByWidth)));
+});
 
 onMounted(() => {
   measureStage();
-  if (stageRef.value && typeof ResizeObserver !== 'undefined') {
+  if (typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => measureStage());
-    resizeObserver.observe(stageRef.value);
+    if (wrapRef.value) resizeObserver.observe(wrapRef.value);
+    if (stageRef.value) resizeObserver.observe(stageRef.value);
   }
 });
 
@@ -303,14 +316,15 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
 </script>
 
 <template>
-  <div class="w-full flex flex-col items-center">
+  <div ref="wrapRef" class="w-full flex flex-col items-center">
     <div
       ref="stageRef"
       class="relative overflow-hidden rounded-xl shadow-lg border border-slate-300 select-none"
       :style="{
         backgroundColor: project.options.bgColor,
         aspectRatio: project.options.aspectRatio === '4:3' ? '4 / 3' : '16 / 9',
-        height: `${maxHeightPx}px`,
+        height: `${effectiveStageHeightPx}px`,
+        width: `${Math.round(effectiveStageHeightPx * (project.options.aspectRatio === '4:3' ? 4 / 3 : 16 / 9))}px`,
         maxWidth: '100%',
       }"
     >

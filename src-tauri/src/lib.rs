@@ -3,8 +3,11 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
+
+static PREV_VERTICAL_BOUNDS: Mutex<Option<(i32, u32)>> = Mutex::new(None);
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1298,12 +1301,52 @@ fn start_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
 
 #[tauri::command]
 fn toggle_window_maximize(window: tauri::WebviewWindow) -> Result<(), String> {
-    let is_max = window.is_maximized().unwrap_or(false);
-    if is_max {
-        window.unmaximize().map_err(|e| e.to_string())
-    } else {
-        window.maximize().map_err(|e| e.to_string())
+    if window.is_maximized().unwrap_or(false) {
+        let _ = window.unmaximize();
     }
+
+    let monitor = window
+        .current_monitor()
+        .map_err(|e| e.to_string())?
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .ok_or_else(|| "No monitor found".to_string())?;
+
+    let work = monitor.work_area();
+    let work_y = work.position.y;
+    let work_h = work.size.height;
+
+    let pos = window.outer_position().map_err(|e| e.to_string())?;
+    let size = window.outer_size().map_err(|e| e.to_string())?;
+    let keep_x = pos.x;
+    let keep_w = size.width;
+
+    let mut guard = PREV_VERTICAL_BOUNDS
+        .lock()
+        .map_err(|_| "Lock error".to_string())?;
+
+    let is_full_height =
+        (pos.y - work_y).abs() <= 24 && (size.height as i32 - work_h as i32).abs() <= 24;
+
+    if is_full_height {
+        if let Some((saved_y, saved_h)) = guard.take() {
+            let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
+                keep_w, saved_h,
+            )));
+            let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+                keep_x, saved_y,
+            )));
+            return Ok(());
+        }
+    }
+
+    *guard = Some((pos.y, size.height));
+    let target_pos = tauri::Position::Physical(tauri::PhysicalPosition::new(keep_x, work_y));
+    let target_size = tauri::Size::Physical(tauri::PhysicalSize::new(keep_w, work_h));
+    window.set_position(target_pos).map_err(|e| e.to_string())?;
+    window.set_size(target_size).map_err(|e| e.to_string())?;
+    window.set_position(target_pos).map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 #[tauri::command]

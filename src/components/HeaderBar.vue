@@ -38,6 +38,7 @@ function onTitlebarDoubleClick(e: MouseEvent) {
   if (isInteractiveElement(e.target)) return;
   if (!project.isTauriEnv) return;
   e.preventDefault();
+  e.stopPropagation();
   void invoke('toggle_window_maximize').catch(() => undefined);
 }
 
@@ -108,10 +109,9 @@ onBeforeUnmount(() => {
 
 <template>
   <header
-    data-tauri-drag-region
     @mousedown="onTitlebarMouseDown"
     @dblclick="onTitlebarDoubleClick"
-    class="w-full bg-white border-b border-slate-200 select-none shrink-0 titlebar-drag relative cursor-default"
+    class="w-full bg-white border-b border-slate-200 select-none shrink-0 relative cursor-default"
     :class="project.screen === 'setup' ? 'pt-7 pb-3 px-8' : 'pt-6 pb-2.5 px-6'"
   >
     <input
