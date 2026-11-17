@@ -77,7 +77,7 @@ const frameGroups = computed(() => timeline.value.groups);
 const bgImageOpacity = computed(() => {
   if (!project.bgImageDataUrl) return 0;
   if (props.editableBox && !project.isPlaying) {
-    return 0.6;
+    return 0.4;
   }
   return computeBackgroundImageOpacity(project.currentTime, timeline.value, project.duration);
 });
@@ -210,6 +210,7 @@ const scaledFontSizePx = computed(() => {
   return Math.max(11, project.options.textSize * 2.12 * scale);
 });
 
+// Crisp solid stroke for live lyrics (no heavy glow blur -> faster compositing & matches ASS export)
 const textStrokeStyle = computed(() => {
   if (!project.options.outline) return {};
   const strokePx = Math.max(1.2, scaledFontSizePx.value * 0.12);
@@ -217,7 +218,22 @@ const textStrokeStyle = computed(() => {
   return {
     WebkitTextStroke: `${strokePx.toFixed(1)}px ${c}`,
     paintOrder: 'stroke fill',
-    textShadow: `0 0 ${(strokePx * 1.4).toFixed(1)}px ${c}`,
+  };
+});
+
+// Soft luminous glow reserved for Intro & Outro Title / Artist / Branding cards
+const titleGlowStyle = computed(() => {
+  const strokePx = project.options.outline ? Math.max(1.2, scaledFontSizePx.value * 0.12) : 0;
+  const glowColor = project.options.outline ? project.options.outlineColor : project.options.activeColor;
+  const glowSpread = Math.max(4, scaledFontSizePx.value * 0.24);
+  return {
+    ...(project.options.outline
+      ? {
+          WebkitTextStroke: `${strokePx.toFixed(1)}px ${project.options.outlineColor}`,
+          paintOrder: 'stroke fill',
+        }
+      : {}),
+    textShadow: `0 0 ${(glowSpread * 0.7).toFixed(1)}px ${glowColor}, 0 0 ${(glowSpread * 1.4).toFixed(1)}px ${glowColor}`,
   };
 });
 
@@ -349,7 +365,7 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
           :style="{
             fontSize: `${scaledFontSizePx * 1.18}px`,
             color: project.options.unsungColor,
-            ...textStrokeStyle,
+            ...titleGlowStyle,
           }"
         >
           {{ project.title }}
@@ -360,7 +376,7 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
           :style="{
             fontSize: `${scaledFontSizePx * 0.78}px`,
             color: project.options.activeColor,
-            ...textStrokeStyle,
+            ...titleGlowStyle,
           }"
         >
           {{ project.artist }}
@@ -418,20 +434,6 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
             </span>
           </div>
         </div>
-      </div>
-
-      <!-- Subtle Outro Credit Watermark (5s before Outro Title/Artist fade-out, 2s in / 2s out at 50% opacity) -->
-      <div
-        v-if="outroWatermarkOpacity > 0"
-        class="absolute inset-x-0 bottom-[6%] flex justify-center px-4 text-center pointer-events-none select-none"
-        :style="{
-          opacity: outroWatermarkOpacity,
-          fontSize: `${Math.max(12, scaledFontSizePx * 0.56)}px`,
-          color: '#ffffff',
-          textShadow: '0 1px 4px rgba(0, 0, 0, 0.75)',
-        }"
-      >
-        {{ OUTRO_WATERMARK_TEXT }}
       </div>
 
       <!-- Lyrics Bounding Box (with optional 4-corner handles in Options mode) -->
@@ -518,6 +520,20 @@ function startCornerDrag(corner: 'tl' | 'tr' | 'bl' | 'br' | 'move', e: PointerE
             title="Drag to resize lyrics width & line spacing"
           ></div>
         </template>
+      </div>
+
+      <!-- Subtle Outro Credit Watermark (7s before Outro Title/Artist fade-out, 2s in / 2s out at 50% opacity) -->
+      <div
+        v-if="outroWatermarkOpacity > 0"
+        class="absolute inset-x-0 bottom-[6%] flex justify-center px-4 text-center pointer-events-none select-none z-10"
+        :style="{
+          opacity: outroWatermarkOpacity,
+          fontSize: `${Math.max(12, scaledFontSizePx * 0.56)}px`,
+          color: '#ffffff',
+          textShadow: '0 1px 4px rgba(0, 0, 0, 0.75)',
+        }"
+      >
+        {{ OUTRO_WATERMARK_TEXT }}
       </div>
     </div>
   </div>

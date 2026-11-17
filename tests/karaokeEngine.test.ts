@@ -287,26 +287,26 @@ describe('KaraoCraft Alignment & Subtitle Engine', () => {
     assert.equal(computeBackgroundImageOpacity(0.0, tl, 85.0), 1.0);
     assert.equal(computeBackgroundImageOpacity(15.0, tl, 85.0), 1.0);
     assert.equal(computeBackgroundImageOpacity(27.6, tl, 85.0), 1.0);
-    // - Midpoint of 5s pre-lyric ramp (30.1s, halfway between 27.6s and 32.6s): 0.80
-    assert.equal(computeBackgroundImageOpacity(30.1, tl, 85.0), 0.8);
-    // - Exact moment first lyrics group starts sweeping (32.6s): exact 0.60
-    assert.equal(computeBackgroundImageOpacity(32.6, tl, 85.0), 0.6);
-    // - During lyrics and across short gap (32.6s .. 50.7s): 0.60
-    assert.equal(computeBackgroundImageOpacity(40.0, tl, 85.0), 0.6);
-    assert.equal(computeBackgroundImageOpacity(45.7, tl, 85.0), 0.6);
-    assert.equal(computeBackgroundImageOpacity(50.7, tl, 85.0), 0.6);
+    // - Midpoint of 5s pre-lyric ramp (30.1s, halfway between 27.6s and 32.6s): 0.70
+    assert.equal(computeBackgroundImageOpacity(30.1, tl, 85.0), 0.7);
+    // - Exact moment first lyrics group starts sweeping (32.6s): exact 0.40
+    assert.equal(computeBackgroundImageOpacity(32.6, tl, 85.0), 0.4);
+    // - During lyrics and across short gap (32.6s .. 50.7s): 0.40
+    assert.equal(computeBackgroundImageOpacity(40.0, tl, 85.0), 0.4);
+    assert.equal(computeBackgroundImageOpacity(45.7, tl, 85.0), 0.4);
+    assert.equal(computeBackgroundImageOpacity(50.7, tl, 85.0), 0.4);
     // - Long Break: starts ramping up 2s before last word of Frame 1 ends (52.7s - 2.0s = 50.7s)
     //   and hits full 1.0 at 3s after last word ends (52.7s + 3.0s = 55.7s)
-    assert.equal(computeBackgroundImageOpacity(53.2, tl, 85.0), 0.8);
+    assert.equal(computeBackgroundImageOpacity(53.2, tl, 85.0), 0.7);
     assert.equal(computeBackgroundImageOpacity(55.7, tl, 85.0), 1.0);
     assert.equal(computeBackgroundImageOpacity(60.0, tl, 85.0), 1.0);
-    // - Long Break -> Next Lyrics Group (68.0s): starts ramping down at 63.0s (68.0s - 5.0s) and hits exact 0.60 at 68.0s
+    // - Long Break -> Next Lyrics Group (68.0s): starts ramping down at 63.0s (68.0s - 5.0s) and hits exact 0.40 at 68.0s
     assert.equal(computeBackgroundImageOpacity(63.0, tl, 85.0), 1.0);
-    assert.equal(computeBackgroundImageOpacity(65.5, tl, 85.0), 0.8);
-    assert.equal(computeBackgroundImageOpacity(68.0, tl, 85.0), 0.6);
+    assert.equal(computeBackgroundImageOpacity(65.5, tl, 85.0), 0.7);
+    assert.equal(computeBackgroundImageOpacity(68.0, tl, 85.0), 0.4);
     // - Outro: last word ends at 72.0s -> ramps up from 70.0s (72.0 - 2.0) to 1.0 at 75.0s (72.0 + 3.0)
-    assert.equal(computeBackgroundImageOpacity(70.0, tl, 85.0), 0.6);
-    assert.equal(computeBackgroundImageOpacity(72.5, tl, 85.0), 0.8);
+    assert.equal(computeBackgroundImageOpacity(70.0, tl, 85.0), 0.4);
+    assert.equal(computeBackgroundImageOpacity(72.5, tl, 85.0), 0.7);
     assert.equal(computeBackgroundImageOpacity(75.0, tl, 85.0), 1.0);
     // - Right after Outro Title/Artist card fades out (tl.outroCard.endSec), 3s fade-out to 0.0
     const outroEnd = tl.outroCard!.endSec;

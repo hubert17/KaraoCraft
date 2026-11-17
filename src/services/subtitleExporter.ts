@@ -421,7 +421,7 @@ export interface BackgroundOpacityRamp {
   toOpacity: number;
 }
 
-const BG_LYRIC_OPACITY = 0.6;
+const BG_LYRIC_OPACITY = 0.4;
 const BG_FULL_OPACITY = 1.0;
 const BG_RAMP_DOWN_BEFORE_LYRICS_SEC = 5.0;
 const BG_RAMP_UP_BEFORE_END_SEC = 2.0;
@@ -431,10 +431,10 @@ const BG_OUTRO_FADEOUT_SEC = 3.0;
 /**
  * Builds the chronological opacity transition ramps for the optional background image:
  * - Starts at 100% (1.0) in Intro (no fade-in).
- * - 5s before first lyrics group starts sweeping -> transitions linearly to 60% (0.60), hitting exact 0.60 at firstLyricStart.
+ * - 5s before first lyrics group starts sweeping -> transitions linearly to 40% (0.40), hitting exact 0.40 at firstLyricStart.
  * - For each long break (gap >= 8.0s):
  *   - 2s before last word finishes sweeping (`cur.endSec - 2.0`) -> transitions to 100% (1.0) at 3s after last word (`cur.endSec + 3.0`).
- *   - 5s before next lyrics group starts sweeping (`next.startSec - 5.0`) -> transitions back to 60% (0.60) at `next.startSec`.
+ *   - 5s before next lyrics group starts sweeping (`next.startSec - 5.0`) -> transitions back to 40% (0.40) at `next.startSec`.
  * - For Outro:
  *   - 2s before final word finishes sweeping (`last.endSec - 2.0`) -> transitions to 100% (1.0) at 3s after last word (`last.endSec + 3.0`).
  *   - Right after Outro Title/Artist card fades out (`outroCard.endSec`), fades out over 3s (`1.0 -> 0.0`).
@@ -658,16 +658,24 @@ export function generateAssSubtitle(params: {
     const fo = Math.round(card.fadeOutSec * 1000);
     const titleY = Math.round(playResY * (isIntro ? 0.41 : 0.44));
     const artistY = Math.round(playResY * (isIntro ? 0.52 : 0.56));
+    const titleGlowBord = Math.max(4, Number((outlinePx + fontSizePx * 0.1).toFixed(1)));
+    const artistGlowBord = Math.max(3, Number((outlinePx * 0.8 + fontSizePx * 0.08).toFixed(1)));
     if (title.trim()) {
       const safeTitle = escapeAssText(title.trim());
       out.push(
-        `Dialogue: ${fgLayer},${formatAssTimestamp(card.startSec)},${formatAssTimestamp(card.endSec)},TitleCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${titleY})${BS}fad(${fi},${fo})}${safeTitle}`
+        `Dialogue: ${fgLayer},${formatAssTimestamp(card.startSec)},${formatAssTimestamp(card.endSec)},TitleCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${titleY})${BS}bord${titleGlowBord}${BS}blur5${BS}3a&H55&${BS}fad(${fi},${fo})}${safeTitle}`
+      );
+      out.push(
+        `Dialogue: ${fgLayer + 1},${formatAssTimestamp(card.startSec)},${formatAssTimestamp(card.endSec)},TitleCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${titleY})${BS}fad(${fi},${fo})}${safeTitle}`
       );
     }
     if (artist.trim()) {
       const safeArtist = escapeAssText(artist.trim());
       out.push(
-        `Dialogue: ${fgLayer},${formatAssTimestamp(card.startSec)},${formatAssTimestamp(card.endSec)},ArtistCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${artistY})${BS}fad(${fi},${fo})}${safeArtist}`
+        `Dialogue: ${fgLayer},${formatAssTimestamp(card.startSec)},${formatAssTimestamp(card.endSec)},ArtistCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${artistY})${BS}bord${artistGlowBord}${BS}blur5${BS}3a&H55&${BS}fad(${fi},${fo})}${safeArtist}`
+      );
+      out.push(
+        `Dialogue: ${fgLayer + 1},${formatAssTimestamp(card.startSec)},${formatAssTimestamp(card.endSec)},ArtistCard,,0,0,0,,{${BS}an5${BS}pos(${centerX},${artistY})${BS}fad(${fi},${fo})}${safeArtist}`
       );
     }
 
