@@ -13,26 +13,41 @@ export type AudioMixMode = 'vocal' | 'instrumental' | 'mix';
 
 type TimeListener = (currentTimeSec: number, isPlaying: boolean) => void;
 
+function dbToLinear(db: number): number {
+  return Math.pow(10, db / 20);
+}
+
 class KaraokeAudioEngine {
   private ctx: AudioContext | null = null;
+  private mixBus: GainNode | null = null;
+  private masterLimiter: DynamicsCompressorNode | null = null;
+  private limiterEngaged = false;
+
   private vocalBuffer: AudioBuffer | null = null;
   private instrumentalBuffer: AudioBuffer | null = null;
+  private backingVocalBuffer: AudioBuffer | null = null;
   private vocalSource: AudioBufferSourceNode | null = null;
   private instrumentalSource: AudioBufferSourceNode | null = null;
+  private backingVocalSource: AudioBufferSourceNode | null = null;
   private vocalGain: GainNode | null = null;
   private instrumentalGain: GainNode | null = null;
+  private backingVocalGain: GainNode | null = null;
 
   private mixMode: AudioMixMode = 'vocal';
   private playbackRate = 1.0;
+  private instrumentalGainDb = 0;
+  private backingVocalGainDb = 0;
   private rafId: number | null = null;
   private listeners = new Set<TimeListener>();
   private hasInstrumental = false;
+  private hasBackingVocal = false;
 
   private playing = false;
   private anchorOffsetSec = 0;
   private anchorCtxTime = 0;
   private durationSec = 0;
   private instLoadToken = 0;
+  private backingLoadToken = 0;
 
   private ensureContext(): AudioContext {
     if (!this.ctx) {
@@ -41,7 +56,45 @@ class KaraokeAudioEngine {
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       this.ctx = new AudioCtx();
     }
+    if (!this.mixBus) {
+      this.mixBus = this.ctx.createGain();
+      this.masterLimiter = this.ctx.createDynamicsCompressor();
+      this.masterLimiter.threshold.value = -1.0;
+      this.masterLimiter.knee.value = 3.0;
+      this.masterLimiter.ratio.value = 20.0;
+      this.masterLimiter.attack.value = 0.003;
+      this.masterLimiter.release.value = 0.08;
+      this.masterLimiter.connect(this.ctx.destination);
+      this.mixBus.connect(this.ctx.destination);
+      this.limiterEngaged = false;
+      this.updateLimiterRouting();
+    }
     return this.ctx;
+  }
+
+  private shouldEngageLimiter(): boolean {
+    if (this.mixMode === 'vocal' || !this.hasInstrumental) return false;
+    return (
+      this.instrumentalGainDb >= 3.0 ||
+      (this.hasBackingVocal && this.backingVocalGainDb >= 3.0)
+    );
+  }
+
+  private updateLimiterRouting() {
+    if (!this.ctx || !this.mixBus || !this.masterLimiter) return;
+    const wantLimiter = this.shouldEngageLimiter();
+    if (wantLimiter === this.limiterEngaged) return;
+    try {
+      this.mixBus.disconnect();
+    } catch {
+      // Ignore if not connected
+    }
+    if (wantLimiter) {
+      this.mixBus.connect(this.masterLimiter);
+    } else {
+      this.mixBus.connect(this.ctx.destination);
+    }
+    this.limiterEngaged = wantLimiter;
   }
 
   subscribe(listener: TimeListener): () => void {
@@ -106,6 +159,16 @@ class KaraokeAudioEngine {
       }
       this.instrumentalSource = null;
     }
+    if (this.backingVocalSource) {
+      try {
+        this.backingVocalSource.onended = null;
+        this.backingVocalSource.stop();
+        this.backingVocalSource.disconnect();
+      } catch {
+        // Ignore already stopped
+      }
+      this.backingVocalSource = null;
+    }
   }
 
   async loadVocalFile(file: File): Promise<DecodedVocalData> {
@@ -163,38 +226,99 @@ class KaraokeAudioEngine {
       });
   }
 
+  loadBackingVocalFile(file: File | null) {
+    const wasPlaying = this.playing;
+    const currentT = this.getCurrentTime();
+    this.pause();
+    this.backingLoadToken++;
+    const token = this.backingLoadToken;
+
+    if (!file) {
+      this.hasBackingVocal = false;
+      this.backingVocalBuffer = null;
+      this.applyVolumes();
+      this.emit();
+      return;
+    }
+
+    this.hasBackingVocal = true;
+    const ctx = this.ensureContext();
+    void file
+      .arrayBuffer()
+      .then((buf) => ctx.decodeAudioData(buf.slice(0)))
+      .then((decoded) => {
+        if (token !== this.backingLoadToken) return;
+        this.backingVocalBuffer = decoded;
+        this.applyVolumes();
+        if (wasPlaying) {
+          this.anchorOffsetSec = currentT;
+          void this.play();
+        }
+      })
+      .catch(() => {
+        if (token !== this.backingLoadToken) return;
+        this.hasBackingVocal = false;
+        this.backingVocalBuffer = null;
+      });
+  }
+
   reset() {
     this.pause();
     this.instLoadToken++;
+    this.backingLoadToken++;
     this.vocalBuffer = null;
     this.instrumentalBuffer = null;
+    this.backingVocalBuffer = null;
     this.hasInstrumental = false;
+    this.hasBackingVocal = false;
+    this.instrumentalGainDb = 0;
+    this.backingVocalGainDb = 0;
     this.mixMode = 'vocal';
     this.playbackRate = 1.0;
     this.anchorOffsetSec = 0;
     this.durationSec = 0;
+    this.updateLimiterRouting();
     this.emit();
   }
 
-  private getGainTargets(): { vocal: number; instrumental: number } {
+  private getGainTargets(): { vocal: number; instrumental: number; backingVocal: number } {
     if (!this.hasInstrumental || !this.instrumentalBuffer || this.mixMode === 'vocal') {
-      return { vocal: 1.0, instrumental: 0.0 };
+      return { vocal: 1.0, instrumental: 0.0, backingVocal: 0.0 };
     }
+    const instLinear = dbToLinear(this.instrumentalGainDb);
+    const backingLinear =
+      this.hasBackingVocal && this.backingVocalBuffer
+        ? dbToLinear(this.backingVocalGainDb)
+        : 0.0;
     if (this.mixMode === 'instrumental') {
-      return { vocal: 0.0, instrumental: 1.0 };
+      return { vocal: 0.0, instrumental: instLinear, backingVocal: backingLinear };
     }
-    // Guide mix: full instrumental + softer guide vocal
-    return { vocal: 0.45, instrumental: 1.0 };
+    // Guide mix: full instrumental + backing vocals + softer guide vocal
+    return { vocal: 0.45, instrumental: instLinear, backingVocal: backingLinear };
   }
 
   private applyVolumes() {
-    const { vocal, instrumental } = this.getGainTargets();
+    const { vocal, instrumental, backingVocal } = this.getGainTargets();
     if (this.vocalGain) {
       this.vocalGain.gain.value = vocal;
     }
     if (this.instrumentalGain) {
       this.instrumentalGain.gain.value = instrumental;
     }
+    if (this.backingVocalGain) {
+      this.backingVocalGain.gain.value = backingVocal;
+    }
+    this.updateLimiterRouting();
+  }
+
+  setInstrumentalGainDb(db: number) {
+    this.instrumentalGainDb = Math.max(-6, Math.min(6, db));
+    this.applyVolumes();
+  }
+
+  setBackingVocalGainDb(db: number) {
+    this.backingVocalGainDb = Math.max(-12, Math.min(6, db));
+    this.applyVolumes();
   }
 
   setMixMode(mode: AudioMixMode) {
@@ -218,6 +342,9 @@ class KaraokeAudioEngine {
     }
     if (this.instrumentalSource) {
       this.instrumentalSource.playbackRate.value = clamped;
+    }
+    if (this.backingVocalSource) {
+      this.backingVocalSource.playbackRate.value = clamped;
     }
   }
 
@@ -252,37 +379,54 @@ class KaraokeAudioEngine {
     }
 
     const offset = Math.max(0, this.anchorOffsetSec);
-    const { vocal, instrumental } = this.getGainTargets();
+    const { vocal, instrumental, backingVocal } = this.getGainTargets();
+    this.updateLimiterRouting();
+    const destinationNode = this.mixBus || ctx.destination;
+    const startWhen = ctx.currentTime + 0.005;
 
     if (this.vocalBuffer && offset < this.vocalBuffer.duration) {
       const vGain = ctx.createGain();
       vGain.gain.value = vocal;
-      vGain.connect(ctx.destination);
+      vGain.connect(destinationNode);
       this.vocalGain = vGain;
 
       const vSrc = ctx.createBufferSource();
       vSrc.buffer = this.vocalBuffer;
       vSrc.playbackRate.value = this.playbackRate;
       vSrc.connect(vGain);
-      vSrc.start(0, offset);
+      vSrc.start(startWhen, offset);
       this.vocalSource = vSrc;
     }
 
     if (this.instrumentalBuffer && offset < this.instrumentalBuffer.duration) {
       const iGain = ctx.createGain();
       iGain.gain.value = instrumental;
-      iGain.connect(ctx.destination);
+      iGain.connect(destinationNode);
       this.instrumentalGain = iGain;
 
       const iSrc = ctx.createBufferSource();
       iSrc.buffer = this.instrumentalBuffer;
       iSrc.playbackRate.value = this.playbackRate;
       iSrc.connect(iGain);
-      iSrc.start(0, offset);
+      iSrc.start(startWhen, offset);
       this.instrumentalSource = iSrc;
     }
 
-    this.anchorCtxTime = ctx.currentTime;
+    if (this.backingVocalBuffer && offset < this.backingVocalBuffer.duration) {
+      const bGain = ctx.createGain();
+      bGain.gain.value = backingVocal;
+      bGain.connect(destinationNode);
+      this.backingVocalGain = bGain;
+
+      const bSrc = ctx.createBufferSource();
+      bSrc.buffer = this.backingVocalBuffer;
+      bSrc.playbackRate.value = this.playbackRate;
+      bSrc.connect(bGain);
+      bSrc.start(startWhen, offset);
+      this.backingVocalSource = bSrc;
+    }
+
+    this.anchorCtxTime = startWhen;
     this.playing = true;
     this.startSyncLoop();
     this.emit();

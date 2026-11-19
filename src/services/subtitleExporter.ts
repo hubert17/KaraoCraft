@@ -840,6 +840,10 @@ export interface KaraoCraftProjectData {
   vocalFilePath?: string;
   instrumentalFileName?: string;
   instrumentalFilePath?: string;
+  backingVocalFileName?: string;
+  backingVocalFilePath?: string;
+  instrumentalGainDb?: number;
+  backingVocalGainDb?: number;
   bgImageFileName?: string;
   bgImageFilePath?: string;
   lyricsOffsetSec?: number;

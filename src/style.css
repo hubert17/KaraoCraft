@@ -17,6 +17,16 @@ body,
   color: #0f172a;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Hiragino Sans", sans-serif;
   -webkit-font-smoothing: antialiased;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+input,
+textarea,
+[contenteditable="true"],
+.select-text {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 /* Musical 5-line staff header background inspired by Croonify */

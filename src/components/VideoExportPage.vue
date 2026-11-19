@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useProjectStore } from '../stores/projectStore';
 import KaraokeRenderer from './KaraokeRenderer.vue';
 import {
@@ -17,6 +17,7 @@ import {
   CheckCircle2,
   X,
   Upload,
+  SlidersHorizontal,
 } from '@lucide/vue';
 
 const project = useProjectStore();
@@ -52,8 +53,45 @@ onUnmounted(() => {
 });
 
 const instInputRef = ref<HTMLInputElement | null>(null);
+const backingVocalInputRef = ref<HTMLInputElement | null>(null);
 const bgImageInputRef = ref<HTMLInputElement | null>(null);
 const renderQuality = ref<'1080p' | '720p'>('1080p');
+const backingPanelMode = ref<'files' | 'gain'>('files');
+
+const INST_SNAP_STOPS = [-6, -3, -1, 0, 1, 3, 6];
+const BACKING_SNAP_STOPS = [-12, -6, -3, -1, 0, 1, 3, 6];
+
+function applyMagneticSnap(raw: number, stops: number[], threshold = 0.3): number {
+  for (const stop of stops) {
+    if (Math.abs(raw - stop) <= threshold) {
+      return stop;
+    }
+  }
+  return Math.round(raw * 10) / 10;
+}
+
+function formatDb(db: number): string {
+  const rounded = Math.round(db * 10) / 10;
+  if (Math.abs(rounded) < 0.05) return '0 dB';
+  const sign = rounded > 0 ? '+' : '';
+  return Number.isInteger(rounded) ? `${sign}${rounded} dB` : `${sign}${rounded.toFixed(1)} dB`;
+}
+
+function onInstrumentalGainInput(e: Event) {
+  const raw = Number((e.target as HTMLInputElement).value);
+  project.setInstrumentalGainDb(applyMagneticSnap(raw, INST_SNAP_STOPS, 0.3));
+}
+
+function onBackingGainInput(e: Event) {
+  const raw = Number((e.target as HTMLInputElement).value);
+  project.setBackingVocalGainDb(applyMagneticSnap(raw, BACKING_SNAP_STOPS, 0.35));
+}
+
+const hasActiveGain = computed(
+  () =>
+    Math.abs(project.instrumentalGainDb) >= 0.05 ||
+    (Boolean(project.backingVocalFile) && Math.abs(project.backingVocalGainDb) >= 0.05)
+);
 
 const offsetOptions = [
   { value: -2, label: '-2.0s (Earlier)' },
@@ -74,6 +112,9 @@ watch(
   () => project.instrumentalFile,
   (file) => {
     exportAudioChoice.value = file ? 'instrumental' : 'vocal';
+    if (!file) {
+      backingPanelMode.value = 'files';
+    }
   }
 );
 
@@ -96,6 +137,22 @@ function onInstSelect(e: Event) {
   const file = input.files?.[0];
   if (file) {
     project.selectInstrumentalFile(file);
+  }
+  input.value = '';
+}
+
+async function handleBrowseBackingVocal() {
+  const handledNatively = await project.browseBackingVocalFile();
+  if (!handledNatively) {
+    backingVocalInputRef.value?.click();
+  }
+}
+
+function onBackingVocalSelect(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (file) {
+    project.selectBackingVocalFile(file, undefined, false);
   }
   input.value = '';
 }
@@ -197,7 +254,9 @@ function onBgImageSelect(e: Event) {
               >
                 {{
                   project.instrumentalFile
-                    ? 'Instrumental Only'
+                    ? project.backingVocalFile
+                      ? 'Instrumental + Backing Vocals'
+                      : 'Instrumental Only'
                     : 'Instrumental Only (attach track below)'
                 }}
               </div>
@@ -311,63 +370,306 @@ function onBgImageSelect(e: Event) {
 
       <!-- 2. Backing Track & Export Cards -->
       <div ref="bottomCardsRef" class="grid grid-cols-1 lg:grid-cols-12 gap-5">
-        <!-- Attach UVR Instrumental Backing Track -->
+        <!-- Attach Instrumental & Optional Backing Vocals + Gain Panel -->
         <div class="lg:col-span-5 bg-white rounded-2xl shadow-card border border-slate-200 p-5 flex flex-col justify-between space-y-3.5">
-          <div class="space-y-2">
-            <div class="flex items-center gap-2 text-lg font-bold text-slate-900">
-              <Music class="w-5 h-5 text-brand-purple" />
-              <h3>Karaoke Backing Track</h3>
+          <div class="space-y-1.5">
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2 text-lg font-bold text-slate-900">
+                <Music class="w-5 h-5 text-brand-purple" />
+                <h3>Karaoke Backing Track</h3>
+              </div>
+
+              <!-- Slick [Gain] Toggle (switches card body between Files and Gain sliders) -->
+              <button
+                v-if="project.instrumentalFile"
+                type="button"
+                @click="backingPanelMode = backingPanelMode === 'gain' ? 'files' : 'gain'"
+                class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold transition-colors cursor-pointer shrink-0"
+                :class="
+                  backingPanelMode === 'gain'
+                    ? 'bg-brand-purple text-white shadow-sm'
+                    : hasActiveGain
+                      ? 'bg-purple-50 text-brand-purple border border-purple-300 hover:bg-purple-100'
+                      : 'bg-slate-100 text-slate-700 border border-slate-200 hover:bg-slate-200/70'
+                "
+                :title="
+                  backingPanelMode === 'gain'
+                    ? 'Back to backing track files'
+                    : 'Adjust Instrumental & Backing Vocals gain (dB)'
+                "
+              >
+                <SlidersHorizontal class="w-3.5 h-3.5" />
+                <span>Gain</span>
+                <span
+                  v-if="hasActiveGain && backingPanelMode !== 'gain'"
+                  class="w-1.5 h-1.5 rounded-full bg-brand-purple"
+                ></span>
+              </button>
             </div>
-            <p class="text-base text-slate-600 leading-relaxed">
-              Attach your <strong>Instrumental Stem</strong> (from UVR5) to export a true vocal-free karaoke video, or render using your current Vocal Stem.
+
+            <p
+              v-if="backingPanelMode === 'gain' && project.instrumentalFile"
+              class="text-xs text-slate-500 leading-relaxed"
+            >
+              Extracted instrumentals often sound quieter after vocal removal — boost to recover loudness and balance backing vocals. Clipping protection engages at <strong class="text-slate-700">+3 dB</strong> and above.
+            </p>
+            <p v-else class="text-sm text-slate-600 leading-relaxed">
+              Attach your <strong class="text-slate-700">Instrumental</strong> (and optional <strong class="text-slate-700">Backing Vocals</strong>) stem from UVR5 or VocalDrop for a true karaoke export.
             </p>
           </div>
 
           <input
             ref="instInputRef"
             type="file"
-            accept="audio/*,.mp3,.wav,.m4a,.flac,.aac,.ogg"
+            accept="audio/*,.mp3,.wav,.m4a,.flac,.aac,.ogg,.opus"
             class="hidden"
             @change="onInstSelect"
           />
+          <input
+            ref="backingVocalInputRef"
+            type="file"
+            accept="audio/*,.mp3,.wav,.m4a,.flac,.aac,.ogg,.opus"
+            class="hidden"
+            @change="onBackingVocalSelect"
+          />
 
-          <div
-            v-if="project.instrumentalFile"
-            class="bg-emerald-50 border border-emerald-300 rounded-xl p-3.5 flex items-center justify-between gap-3"
-          >
-            <div class="min-w-0">
-              <div class="text-xs font-bold uppercase tracking-wider text-emerald-800">
-                Instrumental Ready
-              </div>
-              <div class="text-base font-semibold text-slate-900 truncate">
-                {{ project.instrumentalFileName }}
-              </div>
+          <!-- PANEL A: Files View -->
+          <template v-if="!project.instrumentalFile || backingPanelMode === 'files'">
+            <!-- Attached Instrumental + Optional Backing Vocals -->
+            <div v-if="project.instrumentalFile" class="space-y-2.5">
+              <!-- Instrumental Stem Pill -->
               <div
-                v-if="project.instrumentalFilePath"
-                class="text-xs text-emerald-800/80 font-mono truncate mt-0.5"
-                :title="project.instrumentalFilePath"
+                class="bg-emerald-50 border border-emerald-300 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-2.5"
               >
-                {{ project.instrumentalFilePath }}
+                <div class="min-w-0">
+                  <div class="flex items-center gap-1.5">
+                    <span class="text-[11px] font-bold uppercase tracking-wider text-emerald-800">
+                      Instrumental
+                    </span>
+                    <span
+                      v-if="Math.abs(project.instrumentalGainDb) >= 0.05"
+                      class="text-[11px] font-mono font-bold px-1.5 py-0.2 rounded bg-emerald-200/70 text-emerald-900"
+                    >
+                      {{ formatDb(project.instrumentalGainDb) }}
+                    </span>
+                  </div>
+                  <div
+                    class="text-sm font-semibold text-slate-900 truncate"
+                    :title="project.instrumentalFilePath || project.instrumentalFileName"
+                  >
+                    {{ project.instrumentalFileName }}
+                  </div>
+                </div>
+                <div class="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    @click="handleBrowseInstrumental"
+                    class="px-2 py-1 rounded-md text-xs font-semibold text-emerald-800 hover:bg-emerald-100 transition-colors cursor-pointer"
+                    title="Change Instrumental Track"
+                  >
+                    Change
+                  </button>
+                  <button
+                    type="button"
+                    @click="project.selectInstrumentalFile(null)"
+                    class="p-1 rounded-lg text-slate-500 hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
+                    title="Remove Instrumental Track"
+                  >
+                    <X class="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              <!-- Optional Backing Vocals Pill -->
+              <div
+                v-if="project.backingVocalFile"
+                class="bg-purple-50/70 border border-purple-200 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-2.5"
+              >
+                <div class="min-w-0">
+                  <div class="flex items-center gap-1.5">
+                    <span class="text-[11px] font-bold uppercase tracking-wider text-brand-purple">
+                      Backing Vocals
+                    </span>
+                    <span
+                      v-if="project.backingVocalAutoDetected"
+                      class="text-[10px] font-semibold px-1.5 py-0.2 rounded-full bg-purple-200/70 text-purple-900"
+                    >
+                      Auto
+                    </span>
+                    <span
+                      v-if="Math.abs(project.backingVocalGainDb) >= 0.05"
+                      class="text-[11px] font-mono font-bold px-1.5 py-0.2 rounded bg-purple-200/70 text-purple-900"
+                    >
+                      {{ formatDb(project.backingVocalGainDb) }}
+                    </span>
+                  </div>
+                  <div
+                    class="text-sm font-semibold text-slate-900 truncate"
+                    :title="project.backingVocalFilePath || project.backingVocalFileName"
+                  >
+                    {{ project.backingVocalFileName }}
+                  </div>
+                </div>
+                <div class="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    @click="handleBrowseBackingVocal"
+                    class="px-2 py-1 rounded-md text-xs font-semibold text-brand-purple hover:bg-purple-100 transition-colors cursor-pointer"
+                    title="Change Backing Vocals Stem"
+                  >
+                    Change
+                  </button>
+                  <button
+                    type="button"
+                    @click="project.selectBackingVocalFile(null)"
+                    class="p-1 rounded-lg text-slate-500 hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
+                    title="Remove Backing Vocals Stem"
+                  >
+                    <X class="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              <!-- Compact Add Optional Backing Vocals button -->
+              <button
+                v-else
+                type="button"
+                @click="handleBrowseBackingVocal"
+                class="w-full inline-flex items-center justify-center gap-1.5 rounded-xl border border-dashed border-slate-300 bg-slate-50/70 hover:bg-purple-50/50 hover:border-purple-300 text-slate-600 hover:text-brand-purple font-semibold text-sm py-2 px-3 transition-colors cursor-pointer"
+              >
+                <Upload class="w-4 h-4" />
+                <span>+ Attach Backing Vocals (Optional)</span>
+              </button>
+            </div>
+
+            <!-- Initial Attach Instrumental CTA (when no instrumental attached yet) -->
+            <button
+              v-if="!project.instrumentalFile"
+              type="button"
+              @click="handleBrowseInstrumental"
+              class="w-full inline-flex items-center justify-center gap-2 rounded-xl border-2 border-dashed border-purple-300 bg-purple-50/50 hover:bg-purple-50 text-brand-purple font-semibold text-base py-3 px-4 transition-colors cursor-pointer"
+            >
+              <Upload class="w-5 h-5" />
+              <span>+ Attach Instrumental Track</span>
+            </button>
+          </template>
+
+          <!-- PANEL B: Gain Sliders View -->
+          <div v-else class="space-y-3.5">
+            <!-- Instrumental Gain Slider (-6 dB to +6 dB) -->
+            <div class="space-y-1">
+              <div class="flex items-center justify-between">
+                <label class="text-xs font-bold uppercase tracking-wider text-slate-700">
+                  Instrumental Gain
+                </label>
+                <button
+                  type="button"
+                  @click="project.setInstrumentalGainDb(0)"
+                  class="font-mono text-xs font-bold px-2 py-0.5 rounded-md transition-colors cursor-pointer"
+                  :class="
+                    project.instrumentalGainDb >= 3
+                      ? 'bg-amber-100 text-amber-700 hover:bg-amber-200'
+                      : Math.abs(project.instrumentalGainDb) >= 0.05
+                        ? 'bg-purple-100 text-brand-purple hover:bg-purple-200'
+                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  "
+                  :title="
+                    project.instrumentalGainDb >= 3
+                      ? 'Clipping protection active (≥ +3 dB) · Click to reset to 0 dB'
+                      : 'Click to reset to 0 dB'
+                  "
+                >
+                  {{ formatDb(project.instrumentalGainDb) }}
+                </button>
+              </div>
+              <input
+                type="range"
+                min="-6"
+                max="6"
+                step="0.1"
+                :value="project.instrumentalGainDb"
+                @input="onInstrumentalGainInput"
+                class="w-full h-2 rounded-lg accent-brand-purple cursor-pointer"
+              />
+              <div class="flex items-center justify-between text-[11px] font-mono text-slate-400">
+                <button
+                  v-for="stop in [-6, -3, 0, 1, 3, 6]"
+                  :key="stop"
+                  type="button"
+                  @click="project.setInstrumentalGainDb(stop)"
+                  class="px-1 rounded hover:text-brand-purple transition-colors cursor-pointer"
+                  :class="
+                    Math.abs(project.instrumentalGainDb - stop) < 0.05
+                      ? stop >= 3
+                        ? 'text-amber-600 font-bold'
+                        : 'text-brand-purple font-bold'
+                      : ''
+                  "
+                >
+                  {{ stop > 0 ? `+${stop}` : stop }}
+                </button>
               </div>
             </div>
-            <button
-              type="button"
-              @click="project.selectInstrumentalFile(null)"
-              class="p-1.5 rounded-lg text-slate-500 hover:text-red-600 hover:bg-red-50 transition-colors shrink-0"
-              title="Remove Instrumental Track"
-            >
-              <X class="w-5 h-5" />
-            </button>
-          </div>
 
-          <button
-            type="button"
-            @click="handleBrowseInstrumental"
-            class="w-full inline-flex items-center justify-center gap-2 rounded-xl border-2 border-dashed border-purple-300 bg-purple-50/50 hover:bg-purple-50 text-brand-purple font-semibold text-base py-3 px-4 transition-colors cursor-pointer"
-          >
-            <Upload class="w-5 h-5" />
-            <span>{{ project.instrumentalFile ? 'Change Instrumental Track' : '+ Attach Instrumental Track (UVR)' }}</span>
-          </button>
+            <!-- Backing Vocals Gain Slider (-12 dB to +6 dB) -->
+            <div class="space-y-1" :class="{ 'opacity-45': !project.backingVocalFile }">
+              <div class="flex items-center justify-between">
+                <label class="text-xs font-bold uppercase tracking-wider text-slate-700">
+                  Backing Vocals Gain
+                </label>
+                <button
+                  v-if="project.backingVocalFile"
+                  type="button"
+                  @click="project.setBackingVocalGainDb(0)"
+                  class="font-mono text-xs font-bold px-2 py-0.5 rounded-md transition-colors cursor-pointer"
+                  :class="
+                    project.backingVocalGainDb >= 3
+                      ? 'bg-amber-100 text-amber-700 hover:bg-amber-200'
+                      : Math.abs(project.backingVocalGainDb) >= 0.05
+                        ? 'bg-purple-100 text-brand-purple hover:bg-purple-200'
+                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  "
+                  :title="
+                    project.backingVocalGainDb >= 3
+                      ? 'Clipping protection active (≥ +3 dB) · Click to reset to 0 dB'
+                      : 'Click to reset to 0 dB'
+                  "
+                >
+                  {{ formatDb(project.backingVocalGainDb) }}
+                </button>
+                <span v-else class="text-[11px] font-medium text-slate-400">Not attached</span>
+              </div>
+              <input
+                type="range"
+                min="-12"
+                max="6"
+                step="0.1"
+                :disabled="!project.backingVocalFile"
+                :value="project.backingVocalGainDb"
+                @input="onBackingGainInput"
+                class="w-full h-2 rounded-lg accent-brand-purple cursor-pointer disabled:cursor-not-allowed"
+              />
+              <div class="flex items-center justify-between text-[11px] font-mono text-slate-400">
+                <button
+                  v-for="stop in [-12, -6, -3, 0, 3, 6]"
+                  :key="stop"
+                  type="button"
+                  :disabled="!project.backingVocalFile"
+                  @click="project.setBackingVocalGainDb(stop)"
+                  class="px-1 rounded hover:text-brand-purple transition-colors cursor-pointer disabled:cursor-not-allowed"
+                  :class="
+                    project.backingVocalFile && Math.abs(project.backingVocalGainDb - stop) < 0.05
+                      ? stop >= 3
+                        ? 'text-amber-600 font-bold'
+                        : 'text-brand-purple font-bold'
+                      : ''
+                  "
+                >
+                  {{ stop > 0 ? `+${stop}` : stop }}
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Render MP4 & Download Subtitles -->
@@ -403,7 +705,11 @@ function onBgImageSelect(e: Event) {
                 class="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-base font-medium text-slate-900"
               >
                 <option v-if="project.instrumentalFile" value="instrumental">
-                  Instrumental Stem (Pure Karaoke)
+                  {{
+                    project.backingVocalFile
+                      ? 'Instrumental + Backing Vocals (Karaoke)'
+                      : 'Instrumental Stem (Pure Karaoke)'
+                  }}
                 </option>
                 <option value="vocal">
                   Vocal Stem ({{ project.vocalFileName || 'Current Track' }})

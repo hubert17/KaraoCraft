@@ -91,6 +91,12 @@ export const useProjectStore = defineStore('project', () => {
   const instrumentalFile = ref<File | null>(null);
   const instrumentalFileName = ref('');
   const instrumentalFilePath = ref('');
+  const backingVocalFile = ref<File | null>(null);
+  const backingVocalFileName = ref('');
+  const backingVocalFilePath = ref('');
+  const backingVocalAutoDetected = ref(false);
+  const instrumentalGainDb = ref(0);
+  const backingVocalGainDb = ref(0);
 
   const bgImageFile = ref<File | null>(null);
   const bgImageFileName = ref('');
@@ -321,11 +327,57 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  async function selectInstrumentalFile(file: File | null, explicitPath?: string) {
+  function setInstrumentalGainDb(db: number) {
+    const clamped = Math.round(Math.max(-6, Math.min(6, db)) * 10) / 10;
+    instrumentalGainDb.value = clamped;
+    audioEngine.setInstrumentalGainDb(clamped);
+  }
+
+  function setBackingVocalGainDb(db: number) {
+    const clamped = Math.round(Math.max(-12, Math.min(6, db)) * 10) / 10;
+    backingVocalGainDb.value = clamped;
+    audioEngine.setBackingVocalGainDb(clamped);
+  }
+
+  async function selectBackingVocalFile(
+    file: File | null,
+    explicitPath?: string,
+    autoDetected = false
+  ) {
+    backingVocalFile.value = file;
+    backingVocalFileName.value = file ? file.name : '';
+    backingVocalAutoDetected.value = Boolean(file && autoDetected);
+    if (!file) {
+      backingVocalFilePath.value = '';
+    } else if (explicitPath) {
+      backingVocalFilePath.value = explicitPath;
+      rememberAudioPath(explicitPath);
+    } else if (isTauriEnv.value) {
+      try {
+        const resolved = await invoke<string | null>('resolve_local_audio_path', {
+          fileName: file.name,
+          fileSize: file.size,
+        });
+        backingVocalFilePath.value = resolved || '';
+        if (resolved) rememberAudioPath(resolved);
+      } catch {
+        backingVocalFilePath.value = '';
+      }
+    }
+    audioEngine.loadBackingVocalFile(file);
+  }
+
+  async function selectInstrumentalFile(
+    file: File | null,
+    explicitPath?: string,
+    opts?: { skipAutoDetectBacking?: boolean }
+  ) {
     instrumentalFile.value = file;
     instrumentalFileName.value = file ? file.name : '';
     if (!file) {
       instrumentalFilePath.value = '';
+      // Backing vocals are part of the instrumental track; clear them when instrumental is removed
+      await selectBackingVocalFile(null);
     } else if (explicitPath) {
       instrumentalFilePath.value = explicitPath;
       rememberAudioPath(explicitPath);
@@ -344,6 +396,28 @@ export const useProjectStore = defineStore('project', () => {
     audioEngine.loadInstrumentalFile(file);
     if (file) {
       setMixMode('instrumental');
+      // Auto-detect sibling *_vocals_backing.* in the same folder when available
+      if (
+        isTauriEnv.value &&
+        instrumentalFilePath.value &&
+        !backingVocalFile.value &&
+        !opts?.skipAutoDetectBacking
+      ) {
+        try {
+          const sibling = await invoke<LocalAudioFilePayload | null>(
+            'find_sibling_backing_vocal',
+            {
+              instrumentalPath: instrumentalFilePath.value,
+            }
+          );
+          if (sibling) {
+            const bvFile = base64ToFile(sibling.base64Data, sibling.fileName, sibling.mimeType);
+            await selectBackingVocalFile(bvFile, sibling.filePath, true);
+          }
+        } catch {
+          // Non-fatal if sibling lookup fails
+        }
+      }
     } else {
       setMixMode('vocal');
     }
@@ -375,6 +449,27 @@ export const useProjectStore = defineStore('project', () => {
       if (!payload) return true; // User cancelled dialog
       const fileObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
       await selectInstrumentalFile(fileObj, payload.filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function browseBackingVocalFile(): Promise<boolean> {
+    if (!isTauriEnv.value) return false;
+    try {
+      const payload = await invoke<LocalAudioFilePayload | null>('open_audio_dialog', {
+        prompt: 'Select Backing Vocals Stem (Optional)',
+        initialDir:
+          backingVocalFilePath.value ||
+          instrumentalFilePath.value ||
+          vocalFilePath.value ||
+          lastAudioDir.value ||
+          null,
+      });
+      if (!payload) return true; // User cancelled dialog
+      const fileObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+      await selectBackingVocalFile(fileObj, payload.filePath, false);
       return true;
     } catch {
       return false;
@@ -830,6 +925,10 @@ export const useProjectStore = defineStore('project', () => {
       vocalFilePath: vocalFilePath.value,
       instrumentalFileName: instrumentalFileName.value,
       instrumentalFilePath: instrumentalFilePath.value,
+      backingVocalFileName: backingVocalFileName.value,
+      backingVocalFilePath: backingVocalFilePath.value,
+      instrumentalGainDb: instrumentalGainDb.value,
+      backingVocalGainDb: backingVocalGainDb.value,
       bgImageFileName: bgImageFileName.value,
       bgImageFilePath: bgImageFilePath.value,
       lyricsOffsetSec: lyricsOffsetSec.value,
@@ -865,7 +964,7 @@ export const useProjectStore = defineStore('project', () => {
     }
 
     const safeName = sanitizeFileBase(title.value, 'KaraoCraft_Project');
-    triggerBrowserDownload(`${safeName}.json`, content, 'application/json;charset=utf-8');
+    triggerBrowserDownload(`${safeName}.karaocraft.json`, content, 'application/json;charset=utf-8');
     showSaveConfirmation('Saved');
   }
 
@@ -873,7 +972,7 @@ export const useProjectStore = defineStore('project', () => {
     projectFileError.value = null;
     const content = serializeProjectJson();
     const safeName = sanitizeFileBase(title.value, 'KaraoCraft_Project');
-    const defaultName = `${safeName}.json`;
+    const defaultName = `${safeName}.karaocraft.json`;
 
     if (isTauriEnv.value) {
       try {
@@ -922,6 +1021,14 @@ export const useProjectStore = defineStore('project', () => {
     if (typeof data.vocalFilePath === 'string') vocalFilePath.value = data.vocalFilePath;
     if (typeof data.instrumentalFileName === 'string') instrumentalFileName.value = data.instrumentalFileName;
     if (typeof data.instrumentalFilePath === 'string') instrumentalFilePath.value = data.instrumentalFilePath;
+    backingVocalFile.value = null;
+    backingVocalAutoDetected.value = false;
+    backingVocalFileName.value =
+      typeof data.backingVocalFileName === 'string' ? data.backingVocalFileName : '';
+    backingVocalFilePath.value =
+      typeof data.backingVocalFilePath === 'string' ? data.backingVocalFilePath : '';
+    setInstrumentalGainDb(typeof data.instrumentalGainDb === 'number' ? data.instrumentalGainDb : 0);
+    setBackingVocalGainDb(typeof data.backingVocalGainDb === 'number' ? data.backingVocalGainDb : 0);
     bgImageFile.value = null;
     bgImageDataUrl.value = '';
     bgImageFileName.value = typeof data.bgImageFileName === 'string' ? data.bgImageFileName : '';
@@ -958,9 +1065,22 @@ export const useProjectStore = defineStore('project', () => {
           fileName: data.instrumentalFileName || null,
         });
         const instObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
-        await selectInstrumentalFile(instObj, payload.filePath);
+        await selectInstrumentalFile(instObj, payload.filePath, { skipAutoDetectBacking: true });
       } catch {
         // Non-fatal if optional instrumental stem was moved
+      }
+    }
+
+    if (isTauriEnv.value && (data.backingVocalFilePath || data.backingVocalFileName)) {
+      try {
+        const payload = await invoke<LocalAudioFilePayload>('read_local_audio_file', {
+          filePath: data.backingVocalFilePath || null,
+          fileName: data.backingVocalFileName || null,
+        });
+        const bvObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+        await selectBackingVocalFile(bvObj, payload.filePath, false);
+      } catch {
+        // Non-fatal if optional backing vocal stem was moved
       }
     }
 
@@ -1005,6 +1125,12 @@ export const useProjectStore = defineStore('project', () => {
     instrumentalFile.value = null;
     instrumentalFileName.value = '';
     instrumentalFilePath.value = '';
+    backingVocalFile.value = null;
+    backingVocalFileName.value = '';
+    backingVocalFilePath.value = '';
+    backingVocalAutoDetected.value = false;
+    instrumentalGainDb.value = 0;
+    backingVocalGainDb.value = 0;
     bgImageFile.value = null;
     bgImageFileName.value = '';
     bgImageFilePath.value = '';
@@ -1052,10 +1178,8 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   async function renderMp4Video(quality: '720p' | '1080p', audioChoice: 'instrumental' | 'vocal') {
-    const sourceFile =
-      audioChoice === 'instrumental' && instrumentalFile.value
-        ? instrumentalFile.value
-        : vocalFile.value;
+    const useInstrumental = audioChoice === 'instrumental' && Boolean(instrumentalFile.value);
+    const sourceFile = useInstrumental ? instrumentalFile.value : vocalFile.value;
 
     if (!sourceFile) {
       exportError.value = 'Please select an audio file before exporting video.';
@@ -1080,7 +1204,22 @@ export const useProjectStore = defineStore('project', () => {
 
       const { width, height } = getResolutionDimensions(options.value.aspectRatio, quality);
       const ext = sourceFile.name.split('.').pop() || 'mp3';
-      const audioBase64 = await fileToBase64(sourceFile);
+      const directAudioPath = useInstrumental
+        ? instrumentalFilePath.value || null
+        : vocalFilePath.value || null;
+      const audioBase64 = directAudioPath ? '' : await fileToBase64(sourceFile);
+
+      const includeBacking = useInstrumental && Boolean(backingVocalFile.value);
+      const directBackingPath = includeBacking ? backingVocalFilePath.value || null : null;
+      const backingVocalBase64 =
+        includeBacking && !directBackingPath && backingVocalFile.value
+          ? await fileToBase64(backingVocalFile.value)
+          : null;
+      const backingVocalExt =
+        includeBacking && backingVocalFile.value
+          ? backingVocalFile.value.name.split('.').pop() || 'flac'
+          : null;
+
       const bgImageBase64 = bgImageFile.value ? await fileToBase64(bgImageFile.value) : null;
       const bgImageExt = bgImageFile.value ? bgImageFile.value.name.split('.').pop() || 'png' : null;
 
@@ -1091,8 +1230,14 @@ export const useProjectStore = defineStore('project', () => {
         const res = await invoke<RenderMp4Response>('render_karaoke_mp4', {
           request: {
             assContent,
+            audioPath: directAudioPath,
             audioBase64,
             audioExt: ext,
+            audioGainDb: useInstrumental ? instrumentalGainDb.value : 0,
+            backingVocalPath: directBackingPath,
+            backingVocalBase64,
+            backingVocalExt,
+            backingVocalGainDb: includeBacking ? backingVocalGainDb.value : 0,
             bgColor: options.value.bgColor,
             bgImageBase64,
             bgImageExt,
@@ -1141,6 +1286,12 @@ export const useProjectStore = defineStore('project', () => {
     instrumentalFile,
     instrumentalFileName,
     instrumentalFilePath,
+    backingVocalFile,
+    backingVocalFileName,
+    backingVocalFilePath,
+    backingVocalAutoDetected,
+    instrumentalGainDb,
+    backingVocalGainDb,
     bgImageFile,
     bgImageFileName,
     bgImageFilePath,
@@ -1183,10 +1334,14 @@ export const useProjectStore = defineStore('project', () => {
     detectSystemCapabilities,
     selectVocalFile,
     selectInstrumentalFile,
+    selectBackingVocalFile,
     selectBgImageFile,
     browseVocalFile,
     browseInstrumentalFile,
+    browseBackingVocalFile,
     browseBgImageFile,
+    setInstrumentalGainDb,
+    setBackingVocalGainDb,
     setMixMode,
     setPlaybackRate,
     togglePlay,

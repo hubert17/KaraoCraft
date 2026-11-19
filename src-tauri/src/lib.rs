@@ -48,8 +48,21 @@ pub struct WhisperAlignmentResponse {
 #[serde(rename_all = "camelCase")]
 pub struct RenderMp4Request {
     pub ass_content: String,
+    #[serde(default)]
+    pub audio_path: Option<String>,
+    #[serde(default)]
     pub audio_base64: String,
     pub audio_ext: String,
+    #[serde(default)]
+    pub audio_gain_db: Option<f64>,
+    #[serde(default)]
+    pub backing_vocal_path: Option<String>,
+    #[serde(default)]
+    pub backing_vocal_base64: Option<String>,
+    #[serde(default)]
+    pub backing_vocal_ext: Option<String>,
+    #[serde(default)]
+    pub backing_vocal_gain_db: Option<f64>,
     pub bg_color: String,
     pub bg_image_base64: Option<String>,
     pub bg_image_ext: Option<String>,
@@ -628,14 +641,65 @@ async fn render_karaoke_mp4(request: RenderMp4Request) -> Result<RenderMp4Respon
             .collect::<String>();
         let safe_ext = if ext.is_empty() { "mp3".to_string() } else { ext };
 
-        let audio_path = work_dir.join(format!("input.{}", safe_ext));
         let ass_path = work_dir.join("karaoke.ass");
-
-        let audio_bytes = decode_base64(&request.audio_base64)?;
-        fs::write(&audio_path, audio_bytes)
-            .map_err(|e| format!("Failed to write audio stream: {}", e))?;
         fs::write(&ass_path, request.ass_content.as_bytes())
             .map_err(|e| format!("Failed to write ASS subtitles: {}", e))?;
+
+        let audio_path = if let Some(ref direct_path) = request.audio_path {
+            let p = PathBuf::from(direct_path.trim());
+            if p.is_file() {
+                p
+            } else {
+                let fallback = work_dir.join(format!("input.{}", safe_ext));
+                let audio_bytes = decode_base64(&request.audio_base64)?;
+                fs::write(&fallback, audio_bytes)
+                    .map_err(|e| format!("Failed to write audio stream: {}", e))?;
+                fallback
+            }
+        } else {
+            let fallback = work_dir.join(format!("input.{}", safe_ext));
+            let audio_bytes = decode_base64(&request.audio_base64)?;
+            fs::write(&fallback, audio_bytes)
+                .map_err(|e| format!("Failed to write audio stream: {}", e))?;
+            fallback
+        };
+
+        let mut backing_vocal_path: Option<PathBuf> = None;
+        if let Some(ref bv_direct) = request.backing_vocal_path {
+            let p = PathBuf::from(bv_direct.trim());
+            if p.is_file() {
+                backing_vocal_path = Some(p);
+            }
+        }
+        if backing_vocal_path.is_none() {
+            if let Some(ref bv_b64) = request.backing_vocal_base64 {
+                if !bv_b64.trim().is_empty() {
+                    let bv_bytes = decode_base64(bv_b64)?;
+                    let raw_bv_ext = request
+                        .backing_vocal_ext
+                        .as_deref()
+                        .unwrap_or("flac")
+                        .trim_start_matches('.')
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect::<String>();
+                    let safe_bv_ext = if raw_bv_ext.is_empty() {
+                        "flac".to_string()
+                    } else {
+                        raw_bv_ext
+                    };
+                    let bv_file = work_dir.join(format!("backing.{}", safe_bv_ext));
+                    fs::write(&bv_file, bv_bytes)
+                        .map_err(|e| format!("Failed to write backing vocal stream: {}", e))?;
+                    backing_vocal_path = Some(bv_file);
+                }
+            }
+        }
+
+        let audio_gain_db = request.audio_gain_db.unwrap_or(0.0).clamp(-12.0, 6.0);
+        let backing_gain_db = request.backing_vocal_gain_db.unwrap_or(0.0).clamp(-12.0, 6.0);
+        let enable_limiter = audio_gain_db >= 3.0
+            || (backing_vocal_path.is_some() && backing_gain_db >= 3.0);
 
         let home_dir = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let downloads_dir = PathBuf::from(&home_dir).join("Downloads");
@@ -716,38 +780,62 @@ async fn render_karaoke_mp4(request: RenderMp4Request) -> Result<RenderMp4Respon
         let vf_arg = "ass=karaoke.ass";
         let bitrate = if request.height >= 1080 { "8M" } else { "4M" };
 
+        let build_render_cmd = |video_codec_args: &[&str]| -> Command {
+            let mut cmd = Command::new(&ffmpeg_path);
+            cmd.current_dir(&work_dir).arg("-y");
+            if let Some(ref bg_img) = prepared_bg_path {
+                cmd.args(["-loop", "1", "-framerate", "30", "-t", &duration_str, "-i"])
+                    .arg(bg_img);
+            } else {
+                cmd.args(["-f", "lavfi", "-i", &color_src]);
+            }
+            cmd.arg("-i").arg(&audio_path);
+
+            if let Some(ref bv_path) = backing_vocal_path {
+                cmd.arg("-i").arg(bv_path);
+                let limiter_suffix = if enable_limiter {
+                    ",alimiter=limit=0.95:attack=5:release=50"
+                } else {
+                    ""
+                };
+                let fc = format!(
+                    "[0:v]{}[vout];[1:a]volume={:.2}dB[a1];[2:a]volume={:.2}dB[a2];[a1][a2]amix=inputs=2:duration=longest:normalize=0{}[aout]",
+                    vf_arg, audio_gain_db, backing_gain_db, limiter_suffix
+                );
+                cmd.args(["-filter_complex", &fc, "-map", "[vout]", "-map", "[aout]"]);
+            } else {
+                cmd.args(["-vf", vf_arg]);
+                if audio_gain_db.abs() > 0.01 {
+                    let af = if enable_limiter {
+                        format!(
+                            "volume={:.2}dB,alimiter=limit=0.95:attack=5:release=50",
+                            audio_gain_db
+                        )
+                    } else {
+                        format!("volume={:.2}dB", audio_gain_db)
+                    };
+                    cmd.args(["-af", &af]);
+                }
+            }
+
+            cmd.args(video_codec_args)
+                .args([
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "256k",
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                ])
+                .arg(&output_path);
+            cmd
+        };
+
         // Attempt 1: Apple Silicon Hardware Encoder (h264_videotoolbox)
-        let mut hw_cmd = Command::new(&ffmpeg_path);
-        hw_cmd.current_dir(&work_dir).arg("-y");
-        if let Some(ref bg_img) = prepared_bg_path {
-            hw_cmd
-                .args(["-loop", "1", "-framerate", "30", "-t", &duration_str, "-i"])
-                .arg(bg_img);
-        } else {
-            hw_cmd.args(["-f", "lavfi", "-i", &color_src]);
-        }
-        let hw_run = hw_cmd
-            .arg("-i")
-            .arg(&audio_path)
-            .args([
-                "-vf",
-                vf_arg,
-                "-c:v",
-                "h264_videotoolbox",
-                "-b:v",
-                bitrate,
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "256k",
-                "-shortest",
-                "-movflags",
-                "+faststart",
-            ])
-            .arg(&output_path)
-            .output();
+        let hw_run = build_render_cmd(&["-c:v", "h264_videotoolbox", "-b:v", bitrate]).output();
 
         if let Ok(out) = hw_run {
             if out.status.success() && output_path.is_file() {
@@ -760,38 +848,7 @@ async fn render_karaoke_mp4(request: RenderMp4Request) -> Result<RenderMp4Respon
         }
 
         // Attempt 2: Software libx264 fallback
-        let mut sw_cmd = Command::new(&ffmpeg_path);
-        sw_cmd.current_dir(&work_dir).arg("-y");
-        if let Some(ref bg_img) = prepared_bg_path {
-            sw_cmd
-                .args(["-loop", "1", "-framerate", "30", "-t", &duration_str, "-i"])
-                .arg(bg_img);
-        } else {
-            sw_cmd.args(["-f", "lavfi", "-i", &color_src]);
-        }
-        let sw_run = sw_cmd
-            .arg("-i")
-            .arg(&audio_path)
-            .args([
-                "-vf",
-                vf_arg,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "20",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "256k",
-                "-shortest",
-                "-movflags",
-                "+faststart",
-            ])
-            .arg(&output_path)
+        let sw_run = build_render_cmd(&["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
             .output()
             .map_err(|e| format!("Failed to execute FFmpeg: {}", e))?;
 
@@ -1109,6 +1166,132 @@ async fn read_local_audio_file(
     .map_err(|e| format!("Read audio task panicked: {}", e))?
 }
 
+#[tauri::command]
+async fn find_sibling_backing_vocal(
+    instrumental_path: String,
+) -> Result<Option<LocalAudioFilePayload>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let inst = PathBuf::from(instrumental_path.trim());
+        let Some(parent) = inst.parent() else {
+            return Ok(None);
+        };
+        if !parent.is_dir() {
+            return Ok(None);
+        }
+        let Some(inst_stem) = inst.file_stem().and_then(|s| s.to_str()) else {
+            return Ok(None);
+        };
+        let inst_ext_lower = inst
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        // Strip common instrumental suffixes (case-insensitive) to derive the base track name
+        let inst_stem_lower = inst_stem.to_lowercase();
+        let inst_suffixes = [
+            "_instrumental",
+            "-instrumental",
+            " (instrumental)",
+            " [instrumental]",
+            " instrumental",
+        ];
+        let mut base_name: Option<String> = None;
+        for suffix in inst_suffixes {
+            if inst_stem_lower.ends_with(suffix) && inst_stem.len() > suffix.len() {
+                // Safe char-boundary slicing: suffix is pure ASCII
+                let cut = inst_stem.len() - suffix.len();
+                if inst_stem.is_char_boundary(cut) {
+                    base_name = Some(inst_stem[..cut].to_string());
+                    break;
+                }
+            }
+        }
+        let Some(base) = base_name else {
+            return Ok(None);
+        };
+
+        let base_lower = base.to_lowercase();
+        let backing_suffixes = [
+            "_vocals_backing",
+            "_backing_vocals",
+            "_backing",
+            " (backing vocals)",
+            " [backing vocals]",
+            " (backing)",
+            "-vocals-backing",
+            "-backing-vocals",
+        ];
+        let audio_exts = ["flac", "wav", "mp3", "m4a", "aac", "ogg", "opus"];
+
+        let Ok(entries) = fs::read_dir(parent) else {
+            return Ok(None);
+        };
+
+        let mut best_match: Option<(usize, bool, PathBuf)> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path == inst {
+                continue;
+            }
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let ext_lower = ext.to_lowercase();
+            if !audio_exts.contains(&ext_lower.as_str()) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let stem_lower = stem.to_lowercase();
+            if !stem_lower.starts_with(&base_lower) {
+                continue;
+            }
+            let remainder = &stem_lower[base_lower.len()..];
+            if let Some(priority) = backing_suffixes.iter().position(|s| *s == remainder) {
+                let same_ext = !inst_ext_lower.is_empty() && ext_lower == inst_ext_lower;
+                let replace = match &best_match {
+                    None => true,
+                    Some((best_prio, best_same_ext, _)) => {
+                        priority < *best_prio || (priority == *best_prio && same_ext && !*best_same_ext)
+                    }
+                };
+                if replace {
+                    best_match = Some((priority, same_ext, path));
+                }
+            }
+        }
+
+        let Some((_, _, target_path)) = best_match else {
+            return Ok(None);
+        };
+
+        let bytes = fs::read(&target_path).map_err(|e| {
+            format!(
+                "Could not read backing vocal file '{}': {}",
+                target_path.display(),
+                e
+            )
+        })?;
+        let name = target_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("backing.flac")
+            .to_string();
+        let mime_type = infer_audio_mime(&target_path);
+
+        Ok(Some(LocalAudioFilePayload {
+            file_path: target_path.to_string_lossy().to_string(),
+            file_name: name,
+            base64_data: encode_base64(&bytes),
+            mime_type,
+        }))
+    })
+    .await
+    .map_err(|e| format!("Find sibling backing vocal task panicked: {}", e))?
+}
+
 fn resolve_dialog_dir(primary: Option<&str>, fallback: Option<&str>) -> PathBuf {
     for candidate in [primary, fallback].into_iter().flatten() {
         let trimmed = candidate.trim();
@@ -1249,7 +1432,7 @@ async fn save_project_dialog(
                 set defName to item 1 of argv
                 set defDir to POSIX file (item 2 of argv)
                 try
-                    set chosenFile to choose file name with prompt "Save KaraoCraft Project (.json)" default name defName default location defDir
+                    set chosenFile to choose file name with prompt "Save KaraoCraft Project (.karaocraft.json)" default name defName default location defDir
                     return POSIX path of chosenFile
                 on error number -128
                     return ""
@@ -1271,7 +1454,7 @@ async fn save_project_dialog(
         }
 
         if !chosen.to_lowercase().ends_with(".json") {
-            chosen.push_str(".json");
+            chosen.push_str(".karaocraft.json");
         }
 
         fs::write(&chosen, content.as_bytes())
@@ -1503,6 +1686,7 @@ pub fn run() {
             reveal_in_finder,
             resolve_local_audio_path,
             read_local_audio_file,
+            find_sibling_backing_vocal,
             read_local_image_file,
             open_audio_dialog,
             open_image_dialog,
