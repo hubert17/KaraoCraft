@@ -13,7 +13,7 @@ export interface DecodedVocalData {
   classification: AudioClassificationResult;
 }
 
-export type AudioMixMode = 'vocal' | 'instrumental' | 'mix';
+export type AudioMixMode = 'vocal' | 'instrumental' | 'melody' | 'mix';
 
 type TimeListener = (currentTimeSec: number, isPlaying: boolean) => void;
 
@@ -30,21 +30,26 @@ class KaraokeAudioEngine {
   private vocalBuffer: AudioBuffer | null = null;
   private instrumentalBuffer: AudioBuffer | null = null;
   private backingVocalBuffer: AudioBuffer | null = null;
+  private melodyGuideBuffer: AudioBuffer | null = null;
   private vocalSource: AudioBufferSourceNode | null = null;
   private instrumentalSource: AudioBufferSourceNode | null = null;
   private backingVocalSource: AudioBufferSourceNode | null = null;
+  private melodyGuideSource: AudioBufferSourceNode | null = null;
   private vocalGain: GainNode | null = null;
   private instrumentalGain: GainNode | null = null;
   private backingVocalGain: GainNode | null = null;
+  private melodyGuideGain: GainNode | null = null;
 
   private mixMode: AudioMixMode = 'vocal';
   private playbackRate = 1.0;
   private instrumentalGainDb = 0;
   private backingVocalGainDb = 0;
+  private melodyGuideGainDb = -3;
   private rafId: number | null = null;
   private listeners = new Set<TimeListener>();
   private hasInstrumental = false;
   private hasBackingVocal = false;
+  private hasMelodyGuide = false;
 
   private playing = false;
   private anchorOffsetSec = 0;
@@ -52,6 +57,7 @@ class KaraokeAudioEngine {
   private durationSec = 0;
   private instLoadToken = 0;
   private backingLoadToken = 0;
+  private melodyLoadToken = 0;
 
   private ensureContext(): AudioContext {
     if (!this.ctx) {
@@ -80,7 +86,8 @@ class KaraokeAudioEngine {
     if (this.mixMode === 'vocal' || !this.hasInstrumental) return false;
     return (
       this.instrumentalGainDb >= 3.0 ||
-      (this.hasBackingVocal && this.backingVocalGainDb >= 3.0)
+      (this.hasBackingVocal && this.backingVocalGainDb >= 3.0) ||
+      (this.mixMode === 'melody' && this.hasMelodyGuide && this.melodyGuideGainDb >= 3.0)
     );
   }
 
@@ -172,6 +179,16 @@ class KaraokeAudioEngine {
         // Ignore already stopped
       }
       this.backingVocalSource = null;
+    }
+    if (this.melodyGuideSource) {
+      try {
+        this.melodyGuideSource.onended = null;
+        this.melodyGuideSource.stop();
+        this.melodyGuideSource.disconnect();
+      } catch {
+        // Ignore already stopped
+      }
+      this.melodyGuideSource = null;
     }
   }
 
@@ -266,17 +283,60 @@ class KaraokeAudioEngine {
       });
   }
 
+  loadMelodyGuideFile(file: File | null) {
+    const wasPlaying = this.playing;
+    const currentT = this.getCurrentTime();
+    this.pause();
+    this.melodyLoadToken++;
+    const token = this.melodyLoadToken;
+
+    if (!file) {
+      this.hasMelodyGuide = false;
+      this.melodyGuideBuffer = null;
+      if (this.mixMode === 'melody') {
+        this.mixMode = this.hasInstrumental ? 'instrumental' : 'vocal';
+      }
+      this.applyVolumes();
+      this.emit();
+      return;
+    }
+
+    this.hasMelodyGuide = true;
+    const ctx = this.ensureContext();
+    void file
+      .arrayBuffer()
+      .then((buf) => ctx.decodeAudioData(buf.slice(0)))
+      .then((decoded) => {
+        if (token !== this.melodyLoadToken) return;
+        this.melodyGuideBuffer = decoded;
+        this.applyVolumes();
+        if (wasPlaying) {
+          this.anchorOffsetSec = currentT;
+          void this.play();
+        }
+      })
+      .catch(() => {
+        if (token !== this.melodyLoadToken) return;
+        this.hasMelodyGuide = false;
+        this.melodyGuideBuffer = null;
+      });
+  }
+
   reset() {
     this.pause();
     this.instLoadToken++;
     this.backingLoadToken++;
+    this.melodyLoadToken++;
     this.vocalBuffer = null;
     this.instrumentalBuffer = null;
     this.backingVocalBuffer = null;
+    this.melodyGuideBuffer = null;
     this.hasInstrumental = false;
     this.hasBackingVocal = false;
+    this.hasMelodyGuide = false;
     this.instrumentalGainDb = 0;
     this.backingVocalGainDb = 0;
+    this.melodyGuideGainDb = -3;
     this.mixMode = 'vocal';
     this.playbackRate = 1.0;
     this.anchorOffsetSec = 0;
@@ -285,24 +345,41 @@ class KaraokeAudioEngine {
     this.emit();
   }
 
-  private getGainTargets(): { vocal: number; instrumental: number; backingVocal: number } {
+  private getGainTargets(): {
+    vocal: number;
+    instrumental: number;
+    backingVocal: number;
+    melodyGuide: number;
+  } {
     if (!this.hasInstrumental || !this.instrumentalBuffer || this.mixMode === 'vocal') {
-      return { vocal: 1.0, instrumental: 0.0, backingVocal: 0.0 };
+      return { vocal: 1.0, instrumental: 0.0, backingVocal: 0.0, melodyGuide: 0.0 };
     }
     const instLinear = dbToLinear(this.instrumentalGainDb);
     const backingLinear =
       this.hasBackingVocal && this.backingVocalBuffer
         ? dbToLinear(this.backingVocalGainDb)
         : 0.0;
+    const melodyLinear =
+      this.hasMelodyGuide && this.melodyGuideBuffer
+        ? dbToLinear(this.melodyGuideGainDb)
+        : 0.0;
     if (this.mixMode === 'instrumental') {
-      return { vocal: 0.0, instrumental: instLinear, backingVocal: backingLinear };
+      return { vocal: 0.0, instrumental: instLinear, backingVocal: backingLinear, melodyGuide: 0.0 };
+    }
+    if (this.mixMode === 'melody') {
+      return {
+        vocal: 0.0,
+        instrumental: instLinear,
+        backingVocal: backingLinear,
+        melodyGuide: melodyLinear,
+      };
     }
     // Guide mix: full instrumental + backing vocals + softer guide vocal
-    return { vocal: 0.45, instrumental: instLinear, backingVocal: backingLinear };
+    return { vocal: 0.45, instrumental: instLinear, backingVocal: backingLinear, melodyGuide: 0.0 };
   }
 
   private applyVolumes() {
-    const { vocal, instrumental, backingVocal } = this.getGainTargets();
+    const { vocal, instrumental, backingVocal, melodyGuide } = this.getGainTargets();
     if (this.vocalGain) {
       this.vocalGain.gain.value = vocal;
     }
@@ -311,6 +388,9 @@ class KaraokeAudioEngine {
     }
     if (this.backingVocalGain) {
       this.backingVocalGain.gain.value = backingVocal;
+    }
+    if (this.melodyGuideGain) {
+      this.melodyGuideGain.gain.value = melodyGuide;
     }
     this.updateLimiterRouting();
   }
@@ -325,8 +405,19 @@ class KaraokeAudioEngine {
     this.applyVolumes();
   }
 
+  setMelodyGuideGainDb(db: number) {
+    this.melodyGuideGainDb = Math.max(-9, Math.min(3, db));
+    this.applyVolumes();
+  }
+
   setMixMode(mode: AudioMixMode) {
-    this.mixMode = this.hasInstrumental ? mode : 'vocal';
+    if (!this.hasInstrumental) {
+      this.mixMode = 'vocal';
+    } else if (mode === 'melody' && !this.hasMelodyGuide) {
+      this.mixMode = 'instrumental';
+    } else {
+      this.mixMode = mode;
+    }
     this.applyVolumes();
   }
 
@@ -349,6 +440,9 @@ class KaraokeAudioEngine {
     }
     if (this.backingVocalSource) {
       this.backingVocalSource.playbackRate.value = clamped;
+    }
+    if (this.melodyGuideSource) {
+      this.melodyGuideSource.playbackRate.value = clamped;
     }
   }
 
@@ -383,7 +477,7 @@ class KaraokeAudioEngine {
     }
 
     const offset = Math.max(0, this.anchorOffsetSec);
-    const { vocal, instrumental, backingVocal } = this.getGainTargets();
+    const { vocal, instrumental, backingVocal, melodyGuide } = this.getGainTargets();
     this.updateLimiterRouting();
     const destinationNode = this.mixBus || ctx.destination;
     const startWhen = ctx.currentTime + 0.005;
@@ -428,6 +522,20 @@ class KaraokeAudioEngine {
       bSrc.connect(bGain);
       bSrc.start(startWhen, offset);
       this.backingVocalSource = bSrc;
+    }
+
+    if (this.melodyGuideBuffer && offset < this.melodyGuideBuffer.duration) {
+      const mGain = ctx.createGain();
+      mGain.gain.value = melodyGuide;
+      mGain.connect(destinationNode);
+      this.melodyGuideGain = mGain;
+
+      const mSrc = ctx.createBufferSource();
+      mSrc.buffer = this.melodyGuideBuffer;
+      mSrc.playbackRate.value = this.playbackRate;
+      mSrc.connect(mGain);
+      mSrc.start(startWhen, offset);
+      this.melodyGuideSource = mSrc;
     }
 
     this.anchorCtxTime = startWhen;

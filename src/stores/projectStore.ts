@@ -27,6 +27,14 @@ export type AppScreen = 'setup' | 'editor';
 export type EditorTab = 'basics' | 'options' | 'line-timings' | 'word-timings' | 'video';
 
 export type SeparationQuality = 'fast' | 'max';
+export type MelodyGuideStyle = 'none' | 'flute' | 'synth';
+
+interface GenerateMelodyGuideResponse {
+  filePath: string;
+  fileName: string;
+  style: string;
+  engineUsed: string;
+}
 
 export interface SystemCapabilities {
   ffmpegAvailable: boolean;
@@ -127,6 +135,16 @@ export const useProjectStore = defineStore('project', () => {
   const backingVocalAutoDetected = ref(false);
   const instrumentalGainDb = ref(0);
   const backingVocalGainDb = ref(0);
+
+  // DDSP Instrumental Guide Melody (Flute / Karaoke Synth)
+  const melodyGuideStyle = ref<MelodyGuideStyle>('none');
+  const melodyGuideFile = ref<File | null>(null);
+  const melodyGuideFileName = ref('');
+  const melodyGuideFilePath = ref('');
+  const melodyGuideGainDb = ref(-3); // Barely audible default (-9 dB to +3 dB)
+  const isGeneratingMelodyGuide = ref(false);
+  const melodyGuideError = ref<string | null>(null);
+  const melodyGuideCache = new Map<string, { file: File; filePath: string; fileName: string }>();
 
   const bgImageFile = ref<File | null>(null);
   const bgImageFileName = ref('');
@@ -333,6 +351,7 @@ export const useProjectStore = defineStore('project', () => {
     if (!opts?.skipClassify) {
       inferMetadataFromFilename(file.name);
       lastSeparatedKey.value = '';
+      clearMelodyGuide(true);
     }
 
     if (explicitPath) {
@@ -395,6 +414,110 @@ export const useProjectStore = defineStore('project', () => {
     const clamped = Math.round(Math.max(-12, Math.min(6, db)) * 10) / 10;
     backingVocalGainDb.value = clamped;
     audioEngine.setBackingVocalGainDb(clamped);
+  }
+
+  function setMelodyGuideGainDb(db: number) {
+    const clamped = Math.round(Math.max(-9, Math.min(3, db)) * 10) / 10;
+    melodyGuideGainDb.value = clamped;
+    audioEngine.setMelodyGuideGainDb(clamped);
+  }
+
+  function clearMelodyGuide(resetCache = false) {
+    melodyGuideStyle.value = 'none';
+    melodyGuideFile.value = null;
+    melodyGuideFileName.value = '';
+    melodyGuideFilePath.value = '';
+    melodyGuideError.value = null;
+    if (resetCache) {
+      melodyGuideCache.clear();
+    }
+    audioEngine.loadMelodyGuideFile(null);
+    mixMode.value = audioEngine.getMixMode();
+  }
+
+  async function setMelodyGuideStyle(style: MelodyGuideStyle) {
+    melodyGuideError.value = null;
+    if (style === 'none') {
+      clearMelodyGuide(false);
+      return;
+    }
+
+    if (!vocalFile.value) {
+      melodyGuideStyle.value = 'none';
+      melodyGuideError.value = 'Load a vocal stem first to generate a Melody Guide.';
+      return;
+    }
+
+    const cacheKey = `${vocalFilePath.value || vocalFileName.value}:${vocalFile.value.size}:${style}`;
+    const cached = melodyGuideCache.get(cacheKey);
+    if (cached) {
+      melodyGuideStyle.value = style;
+      melodyGuideFile.value = cached.file;
+      melodyGuideFileName.value = cached.fileName;
+      melodyGuideFilePath.value = cached.filePath;
+      audioEngine.loadMelodyGuideFile(cached.file);
+      audioEngine.setMelodyGuideGainDb(melodyGuideGainDb.value);
+      if (instrumentalFile.value) {
+        setMixMode('melody');
+      }
+      return;
+    }
+
+    if (!isTauriEnv.value) {
+      melodyGuideStyle.value = 'none';
+      melodyGuideError.value = 'DDSP Melody Guide synthesis runs inside the macOS desktop app.';
+      return;
+    }
+
+    const prevStyle = melodyGuideStyle.value;
+    melodyGuideStyle.value = style;
+    isGeneratingMelodyGuide.value = true;
+
+    try {
+      const ext = vocalFile.value.name.split('.').pop() || 'flac';
+      const directVocalPath = vocalFilePath.value || null;
+      const vocalBase64 = directVocalPath ? '' : await fileToBase64(vocalFile.value);
+      const songTitleHint =
+        [artist.value.trim(), title.value.trim()].filter(Boolean).join(' - ') ||
+        title.value.trim() ||
+        null;
+
+      const res = await invoke<GenerateMelodyGuideResponse>('generate_melody_guide', {
+        request: {
+          vocalPath: directVocalPath,
+          vocalBase64,
+          vocalExt: ext,
+          instrumentalPath: instrumentalFilePath.value || null,
+          style,
+          songTitle: songTitleHint,
+        },
+      });
+
+      const payload = await invoke<LocalAudioFilePayload>('read_local_audio_file', {
+        filePath: res.filePath,
+        fileName: null,
+      });
+      const guideFile = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+
+      melodyGuideCache.set(cacheKey, {
+        file: guideFile,
+        filePath: payload.filePath,
+        fileName: payload.fileName,
+      });
+      melodyGuideFile.value = guideFile;
+      melodyGuideFileName.value = payload.fileName;
+      melodyGuideFilePath.value = payload.filePath;
+      audioEngine.loadMelodyGuideFile(guideFile);
+      audioEngine.setMelodyGuideGainDb(melodyGuideGainDb.value);
+      if (instrumentalFile.value) {
+        setMixMode('melody');
+      }
+    } catch (err) {
+      melodyGuideStyle.value = prevStyle;
+      melodyGuideError.value = err instanceof Error ? err.message : String(err);
+    } finally {
+      isGeneratingMelodyGuide.value = false;
+    }
   }
 
   async function selectBackingVocalFile(
@@ -1141,6 +1264,10 @@ export const useProjectStore = defineStore('project', () => {
       backingVocalFilePath: backingVocalFilePath.value,
       instrumentalGainDb: instrumentalGainDb.value,
       backingVocalGainDb: backingVocalGainDb.value,
+      melodyGuideStyle: melodyGuideStyle.value,
+      melodyGuideFileName: melodyGuideFileName.value,
+      melodyGuideFilePath: melodyGuideFilePath.value,
+      melodyGuideGainDb: melodyGuideGainDb.value,
       bgImageFileName: bgImageFileName.value,
       bgImageFilePath: bgImageFilePath.value,
       lyricsOffsetSec: lyricsOffsetSec.value,
@@ -1241,6 +1368,19 @@ export const useProjectStore = defineStore('project', () => {
       typeof data.backingVocalFilePath === 'string' ? data.backingVocalFilePath : '';
     setInstrumentalGainDb(typeof data.instrumentalGainDb === 'number' ? data.instrumentalGainDb : 0);
     setBackingVocalGainDb(typeof data.backingVocalGainDb === 'number' ? data.backingVocalGainDb : 0);
+    melodyGuideCache.clear();
+    melodyGuideFile.value = null;
+    melodyGuideError.value = null;
+    melodyGuideStyle.value =
+      data.melodyGuideStyle === 'flute' || data.melodyGuideStyle === 'synth'
+        ? data.melodyGuideStyle
+        : 'none';
+    melodyGuideFileName.value =
+      typeof data.melodyGuideFileName === 'string' ? data.melodyGuideFileName : '';
+    melodyGuideFilePath.value =
+      typeof data.melodyGuideFilePath === 'string' ? data.melodyGuideFilePath : '';
+    setMelodyGuideGainDb(typeof data.melodyGuideGainDb === 'number' ? data.melodyGuideGainDb : -3);
+    audioEngine.loadMelodyGuideFile(null);
     bgImageFile.value = null;
     bgImageDataUrl.value = '';
     bgImageFileName.value = typeof data.bgImageFileName === 'string' ? data.bgImageFileName : '';
@@ -1296,6 +1436,27 @@ export const useProjectStore = defineStore('project', () => {
       }
     }
 
+    if (
+      isTauriEnv.value &&
+      melodyGuideStyle.value !== 'none' &&
+      (data.melodyGuideFilePath || data.melodyGuideFileName)
+    ) {
+      try {
+        const payload = await invoke<LocalAudioFilePayload>('read_local_audio_file', {
+          filePath: data.melodyGuideFilePath || null,
+          fileName: data.melodyGuideFileName || null,
+        });
+        const mgObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+        melodyGuideFile.value = mgObj;
+        melodyGuideFileName.value = payload.fileName;
+        melodyGuideFilePath.value = payload.filePath;
+        audioEngine.loadMelodyGuideFile(mgObj);
+        audioEngine.setMelodyGuideGainDb(melodyGuideGainDb.value);
+      } catch {
+        melodyGuideStyle.value = 'none';
+      }
+    }
+
     if (isTauriEnv.value && (data.bgImageFilePath || data.bgImageFileName)) {
       try {
         const payload = await invoke<LocalAudioFilePayload>('read_local_image_file', {
@@ -1343,6 +1504,14 @@ export const useProjectStore = defineStore('project', () => {
     backingVocalAutoDetected.value = false;
     instrumentalGainDb.value = 0;
     backingVocalGainDb.value = 0;
+    melodyGuideStyle.value = 'none';
+    melodyGuideFile.value = null;
+    melodyGuideFileName.value = '';
+    melodyGuideFilePath.value = '';
+    melodyGuideGainDb.value = -3;
+    isGeneratingMelodyGuide.value = false;
+    melodyGuideError.value = null;
+    melodyGuideCache.clear();
     bgImageFile.value = null;
     bgImageFileName.value = '';
     bgImageFilePath.value = '';
@@ -1398,8 +1567,17 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  async function renderMp4Video(quality: '720p' | '1080p', audioChoice: 'instrumental' | 'vocal') {
-    const useInstrumental = audioChoice === 'instrumental' && Boolean(instrumentalFile.value);
+  async function renderMp4Video(
+    quality: '720p' | '1080p',
+    audioChoice: 'instrumental' | 'melody' | 'vocal'
+  ) {
+    const useInstrumental =
+      (audioChoice === 'instrumental' || audioChoice === 'melody') && Boolean(instrumentalFile.value);
+    const includeMelody =
+      audioChoice === 'melody' &&
+      useInstrumental &&
+      melodyGuideStyle.value !== 'none' &&
+      Boolean(melodyGuideFile.value);
     const sourceFile = useInstrumental ? instrumentalFile.value : vocalFile.value;
 
     if (!sourceFile) {
@@ -1441,6 +1619,16 @@ export const useProjectStore = defineStore('project', () => {
           ? backingVocalFile.value.name.split('.').pop() || 'flac'
           : null;
 
+      const directMelodyPath = includeMelody ? melodyGuideFilePath.value || null : null;
+      const melodyGuideBase64 =
+        includeMelody && !directMelodyPath && melodyGuideFile.value
+          ? await fileToBase64(melodyGuideFile.value)
+          : null;
+      const melodyGuideExt =
+        includeMelody && melodyGuideFile.value
+          ? melodyGuideFile.value.name.split('.').pop() || 'flac'
+          : null;
+
       const bgImageBase64 = bgImageFile.value ? await fileToBase64(bgImageFile.value) : null;
       const bgImageExt = bgImageFile.value ? bgImageFile.value.name.split('.').pop() || 'png' : null;
 
@@ -1459,6 +1647,10 @@ export const useProjectStore = defineStore('project', () => {
             backingVocalBase64,
             backingVocalExt,
             backingVocalGainDb: includeBacking ? backingVocalGainDb.value : 0,
+            melodyGuidePath: directMelodyPath,
+            melodyGuideBase64,
+            melodyGuideExt,
+            melodyGuideGainDb: includeMelody ? melodyGuideGainDb.value : -3,
             bgColor: options.value.bgColor,
             bgImageBase64,
             bgImageExt,
@@ -1521,6 +1713,13 @@ export const useProjectStore = defineStore('project', () => {
     backingVocalAutoDetected,
     instrumentalGainDb,
     backingVocalGainDb,
+    melodyGuideStyle,
+    melodyGuideFile,
+    melodyGuideFileName,
+    melodyGuideFilePath,
+    melodyGuideGainDb,
+    isGeneratingMelodyGuide,
+    melodyGuideError,
     bgImageFile,
     bgImageFileName,
     bgImageFilePath,
@@ -1572,6 +1771,8 @@ export const useProjectStore = defineStore('project', () => {
     browseBgImageFile,
     setInstrumentalGainDb,
     setBackingVocalGainDb,
+    setMelodyGuideGainDb,
+    setMelodyGuideStyle,
     setMixMode,
     setPlaybackRate,
     togglePlay,
