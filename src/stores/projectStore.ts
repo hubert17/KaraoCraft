@@ -1,7 +1,9 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { audioEngine, base64ToFile, fileToBase64, type AudioMixMode } from '../services/audioEngine';
+import type { AudioSourceClassification } from '../services/audioClassifier';
 import {
   alignLyricsWithWaveform,
   alignLyricsWithWhisperWords,
@@ -24,12 +26,29 @@ import {
 export type AppScreen = 'setup' | 'editor';
 export type EditorTab = 'basics' | 'options' | 'line-timings' | 'word-timings' | 'video';
 
+export type SeparationQuality = 'fast' | 'max';
+
 export interface SystemCapabilities {
   ffmpegAvailable: boolean;
   ffmpegPath: string | null;
   libassAvailable: boolean;
   whisperAvailable: boolean;
   whisperEngine: string | null;
+  separatorAvailable: boolean;
+}
+
+interface SeparationProgressEvent {
+  stage: string;
+  percent: number;
+  message: string;
+}
+
+interface SeparateStemsResponse {
+  outputDir: string;
+  vocalPath: string;
+  instrumentalPath: string;
+  backingVocalPath: string | null;
+  modeUsed: string;
 }
 
 interface WhisperAlignmentResponse {
@@ -67,7 +86,6 @@ export const useProjectStore = defineStore('project', () => {
   const screen = ref<AppScreen>('setup');
   const activeTab = ref<EditorTab>('line-timings');
   const showResyncModal = ref(false);
-  const showUvrGuideModal = ref(false);
   const showAboutModal = showAboutModalRef;
   const showFirstRunSetupModal = showFirstRunSetupRef;
 
@@ -79,6 +97,7 @@ export const useProjectStore = defineStore('project', () => {
     libassAvailable: false,
     whisperAvailable: false,
     whisperEngine: null,
+    separatorAvailable: false,
   });
 
   // Audio Files & Decoded Waveform
@@ -87,6 +106,17 @@ export const useProjectStore = defineStore('project', () => {
   const vocalFilePath = ref('');
   const isDecodingAudio = ref(false);
   const audioError = ref<string | null>(null);
+
+  // Auto-Detection & Built-In AI Stem Separation State
+  const detectedAudioType = ref<AudioSourceClassification | null>(null);
+  const detectionConfidence = ref(0);
+  const needsStemSeparation = ref(false);
+  const separationQuality = ref<SeparationQuality>('fast');
+  const isSeparatingStems = ref(false);
+  const separationError = ref<string | null>(null);
+  const submitProgress = ref(0);
+  const submitStatusMessage = ref('');
+  const lastSeparatedKey = ref('');
 
   const instrumentalFile = ref<File | null>(null);
   const instrumentalFileName = ref('');
@@ -228,6 +258,10 @@ export const useProjectStore = defineStore('project', () => {
     return Boolean(vocalFile.value && !isDecodingAudio.value && rawLyrics.value.trim().length > 0);
   });
 
+  const isBusySubmitting = computed(() => {
+    return isSeparatingStems.value || isAligning.value;
+  });
+
   const lyricsModifiedSinceSync = computed(() => {
     return syncedLyricsSnapshot.value !== '' && rawLyrics.value.trim() !== syncedLyricsSnapshot.value.trim();
   });
@@ -258,7 +292,10 @@ export const useProjectStore = defineStore('project', () => {
     try {
       const caps = await invoke<SystemCapabilities>('check_system_capabilities');
       systemCaps.value = caps;
-      if (promptIfMissing && (!caps.ffmpegAvailable || !caps.whisperAvailable)) {
+      if (
+        promptIfMissing &&
+        (!caps.ffmpegAvailable || !caps.whisperAvailable || !caps.separatorAvailable)
+      ) {
         showFirstRunSetupRef.value = true;
       }
     } catch {
@@ -283,12 +320,20 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
-  async function selectVocalFile(file: File, explicitPath?: string) {
+  async function selectVocalFile(
+    file: File,
+    explicitPath?: string,
+    opts?: { skipClassify?: boolean }
+  ) {
     audioError.value = null;
+    separationError.value = null;
     isDecodingAudio.value = true;
     vocalFile.value = file;
     vocalFileName.value = file.name;
-    inferMetadataFromFilename(file.name);
+    if (!opts?.skipClassify) {
+      inferMetadataFromFilename(file.name);
+      lastSeparatedKey.value = '';
+    }
 
     if (explicitPath) {
       vocalFilePath.value = explicitPath;
@@ -314,6 +359,16 @@ export const useProjectStore = defineStore('project', () => {
       rmsEnvelope.value = decoded.rmsEnvelope;
       rmsHz.value = decoded.rmsHz;
       currentTime.value = 0;
+
+      if (opts?.skipClassify) {
+        detectedAudioType.value = 'isolated_vocal';
+        detectionConfidence.value = 0.99;
+        needsStemSeparation.value = false;
+      } else {
+        detectedAudioType.value = decoded.classification.classification;
+        detectionConfidence.value = decoded.classification.confidence;
+        needsStemSeparation.value = decoded.classification.classification === 'full_mix';
+      }
     } catch (err) {
       audioError.value =
         err instanceof Error
@@ -322,6 +377,9 @@ export const useProjectStore = defineStore('project', () => {
       vocalFile.value = null;
       vocalFileName.value = '';
       vocalFilePath.value = '';
+      detectedAudioType.value = null;
+      detectionConfidence.value = 0;
+      needsStemSeparation.value = false;
     } finally {
       isDecodingAudio.value = false;
     }
@@ -427,7 +485,7 @@ export const useProjectStore = defineStore('project', () => {
     if (!isTauriEnv.value) return false;
     try {
       const payload = await invoke<LocalAudioFilePayload | null>('open_audio_dialog', {
-        prompt: 'Select Vocal Stem Audio File',
+        prompt: 'Select Song or Vocal Audio File',
         initialDir: vocalFilePath.value || lastAudioDir.value || null,
       });
       if (!payload) return true; // User cancelled dialog
@@ -435,6 +493,24 @@ export const useProjectStore = defineStore('project', () => {
       await selectVocalFile(fileObj, payload.filePath);
       return true;
     } catch {
+      return false;
+    }
+  }
+
+  async function loadVocalFromPath(filePath: string): Promise<boolean> {
+    if (!isTauriEnv.value || !filePath.trim()) return false;
+    audioError.value = null;
+    try {
+      const payload = await invoke<LocalAudioFilePayload>('read_local_audio_file', {
+        filePath: filePath.trim(),
+        fileName: null,
+      });
+      const fileObj = base64ToFile(payload.base64Data, payload.fileName, payload.mimeType);
+      await selectVocalFile(fileObj, payload.filePath);
+      return true;
+    } catch (err) {
+      audioError.value =
+        err instanceof Error ? err.message : 'Could not load dropped audio file.';
       return false;
     }
   }
@@ -635,10 +711,21 @@ export const useProjectStore = defineStore('project', () => {
     rawLyrics.value = cleaned.trim();
   }
 
-  async function runFullAlignment() {
+  async function runFullAlignment(progressStart = 12) {
     if (!rawLyrics.value.trim()) return;
     isAligning.value = true;
-    alignmentMessage.value = 'Syncing lyrics to song...';
+    alignmentMessage.value = 'Syncing lyrics…';
+    submitStatusMessage.value = 'Syncing lyrics…';
+    submitProgress.value = Math.max(submitProgress.value, progressStart);
+
+    const tickTarget = 95;
+    const progressTimer = setInterval(() => {
+      if (submitProgress.value < tickTarget) {
+        const remaining = tickTarget - submitProgress.value;
+        const step = Math.max(0.8, remaining * 0.14);
+        submitProgress.value = Math.min(tickTarget, Math.round((submitProgress.value + step) * 10) / 10);
+      }
+    }, 280);
 
     try {
       let aligned: AlignedLyricLine[] | null = null;
@@ -648,7 +735,8 @@ export const useProjectStore = defineStore('project', () => {
       }
 
       if (isTauriEnv.value && systemCaps.value.whisperAvailable && vocalFile.value) {
-        alignmentMessage.value = 'Syncing lyrics to song...';
+        alignmentMessage.value = 'Syncing lyrics…';
+        submitStatusMessage.value = 'Syncing lyrics…';
         try {
           const ext = vocalFile.value.name.split('.').pop() || 'mp3';
           const b64 = await fileToBase64(vocalFile.value);
@@ -691,15 +779,139 @@ export const useProjectStore = defineStore('project', () => {
       selectedLineIndex.value = 0;
       selectedWordId.value = aligned[0]?.words[0]?.id ?? null;
       undoStack.value = [];
+      submitProgress.value = 100;
+      submitStatusMessage.value = 'Ready!';
     } finally {
+      clearInterval(progressTimer);
       isAligning.value = false;
       alignmentMessage.value = '';
     }
   }
 
   async function submitSetup() {
-    if (!canSubmit.value) return;
-    await runFullAlignment();
+    if (!canSubmit.value || isBusySubmitting.value) return;
+    separationError.value = null;
+    submitProgress.value = 0;
+    submitStatusMessage.value = '';
+
+    const sourceKey = `${vocalFilePath.value || vocalFileName.value}:${vocalFile.value?.size ?? 0}:${separationQuality.value}`;
+    const shouldSeparate =
+      needsStemSeparation.value &&
+      Boolean(vocalFile.value) &&
+      lastSeparatedKey.value !== sourceKey;
+
+    if (shouldSeparate && vocalFile.value) {
+      if (!isTauriEnv.value) {
+        separationError.value =
+          'Built-in AI stem extraction runs in the macOS desktop app. Continuing with lyrics sync in browser preview mode.';
+      } else {
+        if (!systemCaps.value.separatorAvailable) {
+          await detectSystemCapabilities();
+        }
+        if (!systemCaps.value.separatorAvailable) {
+          separationError.value =
+            'AI Stem Separator is not installed yet. Click "Download & Install Automatically" in Studio Setup, or click "Already vocals? Skip" above.';
+          showFirstRunSetupRef.value = true;
+          return;
+        }
+
+        isSeparatingStems.value = true;
+        submitProgress.value = 3;
+        submitStatusMessage.value = 'Loading AI engine…';
+
+        let unlistenSep: UnlistenFn | null = null;
+        try {
+          unlistenSep = await listen<SeparationProgressEvent>('separation-progress', (ev) => {
+            const pct = Math.max(0, Math.min(84, ev.payload.percent));
+            if (pct > submitProgress.value) {
+              submitProgress.value = pct;
+            }
+            if (ev.payload.message) {
+              submitStatusMessage.value = ev.payload.message;
+            }
+          });
+
+          const ext = vocalFile.value.name.split('.').pop() || 'mp3';
+          const directPath = vocalFilePath.value || null;
+          const b64 = directPath ? '' : await fileToBase64(vocalFile.value);
+          const songTitleHint =
+            [artist.value.trim(), title.value.trim()].filter(Boolean).join(' - ') ||
+            title.value.trim() ||
+            null;
+
+          const res = await invoke<SeparateStemsResponse>('separate_audio_stems', {
+            request: {
+              audioPath: directPath,
+              audioBase64: b64,
+              audioExt: ext,
+              mode: separationQuality.value,
+              songTitle: songTitleHint,
+            },
+          });
+
+          submitProgress.value = Math.max(submitProgress.value, 84);
+          submitStatusMessage.value = 'Loading stems…';
+
+          // 1. Load extracted Lead Vocal stem for waveform + MMS_FA alignment
+          const vocalPayload = await invoke<LocalAudioFilePayload>('read_local_audio_file', {
+            filePath: res.vocalPath,
+            fileName: null,
+          });
+          const leadVocalFile = base64ToFile(
+            vocalPayload.base64Data,
+            vocalPayload.fileName,
+            vocalPayload.mimeType
+          );
+          await selectVocalFile(leadVocalFile, vocalPayload.filePath, { skipClassify: true });
+
+          // 2. Load extracted Instrumental (or Karaoke Backing in FAST mode)
+          const instPayload = await invoke<LocalAudioFilePayload>('read_local_audio_file', {
+            filePath: res.instrumentalPath,
+            fileName: null,
+          });
+          const instFileObj = base64ToFile(
+            instPayload.base64Data,
+            instPayload.fileName,
+            instPayload.mimeType
+          );
+          await selectInstrumentalFile(instFileObj, instPayload.filePath, {
+            skipAutoDetectBacking: true,
+          });
+
+          // 3. Load Backing Vocals stem if MAX (3-Stem) mode produced one
+          if (res.backingVocalPath) {
+            const bvPayload = await invoke<LocalAudioFilePayload>('read_local_audio_file', {
+              filePath: res.backingVocalPath,
+              fileName: null,
+            });
+            const bvFileObj = base64ToFile(
+              bvPayload.base64Data,
+              bvPayload.fileName,
+              bvPayload.mimeType
+            );
+            await selectBackingVocalFile(bvFileObj, bvPayload.filePath, true);
+          } else {
+            await selectBackingVocalFile(null);
+          }
+
+          lastSeparatedKey.value = sourceKey;
+          submitProgress.value = 88;
+        } catch (err) {
+          separationError.value = err instanceof Error ? err.message : String(err);
+          submitProgress.value = 0;
+          submitStatusMessage.value = '';
+          return;
+        } finally {
+          unlistenSep?.();
+          isSeparatingStems.value = false;
+        }
+      }
+    }
+
+    await runFullAlignment(shouldSeparate ? 88 : 14);
+    await new Promise((r) => setTimeout(r, 180));
+    submitProgress.value = 0;
+    submitStatusMessage.value = '';
     screen.value = 'editor';
     activeTab.value = 'line-timings';
   }
@@ -1155,6 +1367,15 @@ export const useProjectStore = defineStore('project', () => {
     projectSaveStatus.value = null;
     projectFileError.value = null;
     audioError.value = null;
+    detectedAudioType.value = null;
+    detectionConfidence.value = 0;
+    needsStemSeparation.value = false;
+    separationQuality.value = 'fast';
+    isSeparatingStems.value = false;
+    separationError.value = null;
+    submitProgress.value = 0;
+    submitStatusMessage.value = '';
+    lastSeparatedKey.value = '';
     lastExportedMp4Path.value = null;
     lastEncoderUsed.value = null;
     exportError.value = null;
@@ -1273,7 +1494,6 @@ export const useProjectStore = defineStore('project', () => {
     screen,
     activeTab,
     showResyncModal,
-    showUvrGuideModal,
     showAboutModal,
     showFirstRunSetupModal,
     isTauriEnv,
@@ -1283,6 +1503,15 @@ export const useProjectStore = defineStore('project', () => {
     vocalFilePath,
     isDecodingAudio,
     audioError,
+    detectedAudioType,
+    detectionConfidence,
+    needsStemSeparation,
+    separationQuality,
+    isSeparatingStems,
+    separationError,
+    submitProgress,
+    submitStatusMessage,
+    isBusySubmitting,
     instrumentalFile,
     instrumentalFileName,
     instrumentalFilePath,
@@ -1337,6 +1566,7 @@ export const useProjectStore = defineStore('project', () => {
     selectBackingVocalFile,
     selectBgImageFile,
     browseVocalFile,
+    loadVocalFromPath,
     browseInstrumentalFile,
     browseBackingVocalFile,
     browseBgImageFile,

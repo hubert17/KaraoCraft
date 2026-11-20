@@ -1,3 +1,5 @@
+import { classifyAudioChannels, type AudioClassificationResult } from './audioClassifier';
+
 export interface DecodedVocalData {
   duration: number;
   sampleRate: number;
@@ -7,6 +9,8 @@ export interface DecodedVocalData {
   rmsHz: number;
   /** Short-time RMS energy values at rmsHz (50 Hz = 20ms frames) */
   rmsEnvelope: Float32Array;
+  /** Auto-detected classification: full_mix vs isolated_vocal */
+  classification: AudioClassificationResult;
 }
 
 export type AudioMixMode = 'vocal' | 'instrumental' | 'mix';
@@ -181,7 +185,7 @@ class KaraokeAudioEngine {
     this.vocalBuffer = audioBuffer;
     this.durationSec = audioBuffer.duration;
     this.emit();
-    return this.extractWaveformAndEnvelope(audioBuffer);
+    return this.extractWaveformAndEnvelope(audioBuffer, file.name);
   }
 
   loadInstrumentalFile(file: File | null) {
@@ -465,7 +469,7 @@ class KaraokeAudioEngine {
     }
   }
 
-  private extractWaveformAndEnvelope(buffer: AudioBuffer): DecodedVocalData {
+  private extractWaveformAndEnvelope(buffer: AudioBuffer, fileName = ''): DecodedVocalData {
     const duration = buffer.duration;
     const sampleRate = buffer.sampleRate;
     const numChannels = buffer.numberOfChannels;
@@ -473,6 +477,7 @@ class KaraokeAudioEngine {
 
     const ch0 = buffer.getChannelData(0);
     const ch1 = numChannels > 1 ? buffer.getChannelData(1) : null;
+    const classification = classifyAudioChannels(ch0, ch1, sampleRate, fileName);
 
     // 1. Extract high-resolution waveform min/max peaks (100 buckets/sec)
     const peaksPerSecond = 120;
@@ -543,6 +548,7 @@ class KaraokeAudioEngine {
       peaks,
       rmsHz,
       rmsEnvelope,
+      classification,
     };
   }
 }

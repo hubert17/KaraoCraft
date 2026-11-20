@@ -8,7 +8,6 @@ import BasicsPage from './components/BasicsPage.vue';
 import OptionsPage from './components/OptionsPage.vue';
 import TimingsEditor from './components/TimingsEditor.vue';
 import VideoExportPage from './components/VideoExportPage.vue';
-import UvrGuideModal from './components/UvrGuideModal.vue';
 import ResyncModal from './components/ResyncModal.vue';
 import AboutModal from './components/AboutModal.vue';
 import FirstRunSetupModal from './components/FirstRunSetupModal.vue';
@@ -42,7 +41,6 @@ onMounted(() => {
     </div>
 
     <!-- Modals -->
-    <UvrGuideModal />
     <ResyncModal />
     <AboutModal />
     <FirstRunSetupModal />

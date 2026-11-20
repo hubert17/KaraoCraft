@@ -414,7 +414,7 @@ function onBgImageSelect(e: Event) {
               Extracted instrumentals often sound quieter after vocal removal — boost to recover loudness and balance backing vocals. Clipping protection engages at <strong class="text-slate-700">+3 dB</strong> and above.
             </p>
             <p v-else class="text-sm text-slate-600 leading-relaxed">
-              Attach your <strong class="text-slate-700">Instrumental</strong> (and optional <strong class="text-slate-700">Backing Vocals</strong>) stem from UVR5 or VocalDrop for a true karaoke export.
+              Auto-populated from built-in stem extraction, or attach custom <strong class="text-slate-700">Instrumental</strong> and <strong class="text-slate-700">Backing Vocals</strong> stems.
             </p>
           </div>
 

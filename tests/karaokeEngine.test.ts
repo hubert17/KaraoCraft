@@ -6,6 +6,10 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import {
+  classifyAudioChannels,
+  detectVocalFilenameHint,
+} from '../src/services/audioClassifier.ts';
+import {
   alignLyricsWithWaveform,
   alignLyricsWithWhisperWords,
   resyncWordsWithinLines,
@@ -456,5 +460,55 @@ describe('KaraoCraft Alignment & Subtitle Engine', () => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     }
+  });
+
+  it('auto-detects isolated vocal stems vs full song mixes via DSP + filename hints', () => {
+    const sr = 22050;
+    const durSec = 8;
+    const len = sr * durSec;
+
+    // 1. Synthetic isolated vocal: mono centered 440Hz+880Hz phrases with ~45% digital silence
+    const vocL = new Float32Array(len);
+    const vocR = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      const t = i / sr;
+      const inPhrase = (t >= 1.5 && t <= 3.5) || (t >= 5.0 && t <= 7.2);
+      if (inPhrase) {
+        const s = 0.35 * Math.sin(2 * Math.PI * 440 * t) + 0.2 * Math.sin(2 * Math.PI * 880 * t);
+        vocL[i] = s;
+        vocR[i] = s;
+      }
+    }
+    const vocRes = classifyAudioChannels(vocL, vocR, sr, 'My Song.wav');
+    assert.equal(vocRes.classification, 'isolated_vocal', `Expected isolated_vocal, got ${JSON.stringify(vocRes)}`);
+    assert.ok(vocRes.metrics.subBassRatio < 0.05);
+    assert.ok(vocRes.metrics.silenceRatio > 0.35);
+
+    // 2. Synthetic full mix: continuous 60Hz sub-bass + wide stereo instruments (no silent gaps)
+    const mixL = new Float32Array(len);
+    const mixR = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      const t = i / sr;
+      const bass = 0.55 * Math.sin(2 * Math.PI * 60 * t);
+      const guitarL = 0.3 * Math.sin(2 * Math.PI * 330 * t);
+      const synthR = 0.3 * Math.sin(2 * Math.PI * 523 * t + 0.9);
+      mixL[i] = bass + guitarL;
+      mixR[i] = bass + synthR;
+    }
+    const mixRes = classifyAudioChannels(mixL, mixR, sr, 'Artist - Hit Song.mp3');
+    assert.equal(mixRes.classification, 'full_mix', `Expected full_mix, got ${JSON.stringify(mixRes)}`);
+    assert.ok(mixRes.metrics.subBassRatio > 0.14);
+    assert.ok(mixRes.metrics.silenceRatio < 0.05);
+
+    // 3. Filename hint helper distinguishes vocal tags from backing/instrumental/normal names
+    assert.equal(detectVocalFilenameHint('Song (Vocals).wav'), 'vocal');
+    assert.equal(detectVocalFilenameHint('Track_vocals.flac'), 'vocal');
+    assert.equal(detectVocalFilenameHint('Track_vocals_backing.flac'), 'none');
+    assert.equal(detectVocalFilenameHint('Vocaloid - World Is Mine.mp3'), 'none');
+    assert.equal(detectVocalFilenameHint('Artist - Song_instrumental.flac'), 'none');
+
+    // 4. Strong full-mix DSP still overrides an accidental vocal filename tag
+    const overrideRes = classifyAudioChannels(mixL, mixR, sr, 'Song (Vocals).mp3');
+    assert.equal(overrideRes.classification, 'full_mix');
   });
 });

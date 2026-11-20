@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
@@ -17,6 +18,14 @@ pub struct SetupProgressEvent {
     pub message: String,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SeparationProgressEvent {
+    pub stage: String,
+    pub percent: u8,
+    pub message: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemCapabilities {
@@ -25,6 +34,30 @@ pub struct SystemCapabilities {
     pub libass_available: bool,
     pub whisper_available: bool,
     pub whisper_engine: Option<String>,
+    pub separator_available: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeparateStemsRequest {
+    #[serde(default)]
+    pub audio_path: Option<String>,
+    #[serde(default)]
+    pub audio_base64: String,
+    pub audio_ext: String,
+    pub mode: String,
+    #[serde(default)]
+    pub song_title: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeparateStemsResponse {
+    pub output_dir: String,
+    pub vocal_path: String,
+    pub instrumental_path: String,
+    pub backing_vocal_path: Option<String>,
+    pub mode_used: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -420,6 +453,230 @@ if __name__ == "__main__":
     main()
 "#;
 
+fn find_separator_python() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = vec![
+        app_runtime_dir().join("venv/bin/python"),
+        app_runtime_dir().join("venv/bin/python3"),
+        app_runtime_dir().join("separator-venv/bin/python"),
+        app_runtime_dir().join("separator-venv/bin/python3"),
+    ];
+    if let Ok(home) = env::var("HOME") {
+        let home_path = PathBuf::from(&home);
+        candidates.push(home_path.join(".local/pipx/venvs/audio-separator/bin/python"));
+        candidates.push(home_path.join(".local/pipx/venvs/openai-whisper/bin/python"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/python3"));
+    candidates.push(PathBuf::from("/usr/local/bin/python3"));
+
+    for py in candidates {
+        if !py.is_file() {
+            continue;
+        }
+        if let Ok(status) = Command::new(&py)
+            .args(["-c", "from audio_separator.separator import Separator"])
+            .status()
+        {
+            if status.success() {
+                return Some(py);
+            }
+        }
+    }
+    None
+}
+
+const STEM_SEPARATOR_SCRIPT: &str = r#"import inspect, json, logging, os, shutil, sys, time
+
+# Track active progress window so tqdm updates map cleanly into 0..84%
+PROGRESS_STATE = {
+    "start": 5,
+    "end": 80,
+    "stage": "separating",
+    "label": "Extracting stems",
+    "last_pct": -1,
+    "last_ts": 0.0,
+}
+
+def emit_progress(stage, percent, message):
+    pct = max(0, min(100, int(round(percent))))
+    PROGRESS_STATE["last_pct"] = max(PROGRESS_STATE["last_pct"], pct)
+    payload = {"stage": stage, "percent": PROGRESS_STATE["last_pct"], "message": message}
+    sys.stdout.write("PROGRESS:" + json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+def install_tqdm_hook():
+    try:
+        import tqdm
+        import tqdm.auto as tqdm_auto
+    except Exception:
+        return
+
+    OrigTqdm = tqdm.tqdm
+
+    class KaraoCraftTqdm(OrigTqdm):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("disable", False)
+            super().__init__(*args, **kwargs)
+
+        def update(self, n=1):
+            res = super().update(n)
+            total = getattr(self, "total", None)
+            if total and total > 0:
+                frac = max(0.0, min(1.0, float(self.n) / float(total)))
+                s = PROGRESS_STATE["start"]
+                e = PROGRESS_STATE["end"]
+                mapped = s + frac * (e - s)
+                now = time.monotonic()
+                if int(mapped) >= PROGRESS_STATE["last_pct"] + 2 or (now - PROGRESS_STATE["last_ts"] >= 1.2 and int(mapped) > PROGRESS_STATE["last_pct"]):
+                    PROGRESS_STATE["last_ts"] = now
+                    emit_progress(
+                        PROGRESS_STATE["stage"],
+                        mapped,
+                        PROGRESS_STATE["label"],
+                    )
+            return res
+
+    tqdm.tqdm = KaraoCraftTqdm
+    tqdm_auto.tqdm = KaraoCraftTqdm
+
+def resolve_outputs(files, base_dir):
+    resolved = []
+    for f in files or []:
+        p = f if os.path.isabs(f) else os.path.join(base_dir, f)
+        if os.path.isfile(p):
+            resolved.append(p)
+    return resolved
+
+def pick_vocal_and_other(paths):
+    vocal = None
+    other = None
+    for p in paths:
+        name = os.path.basename(p).lower()
+        if "(vocals)" in name or "_vocals" in name or "(lead" in name:
+            vocal = p
+        elif "(instrumental)" in name or "(other)" in name or "(no_vocals)" in name or "(backing" in name:
+            other = p
+    if vocal is None and paths:
+        vocal = paths[0]
+    if other is None:
+        for p in paths:
+            if p != vocal:
+                other = p
+                break
+    return vocal, other
+
+def build_separator(Separator, models_dir, work_dir):
+    kwargs = {
+        "log_level": logging.WARNING,
+        "model_file_dir": models_dir,
+        "output_dir": work_dir,
+        "output_format": "FLAC",
+    }
+    try:
+        sig = inspect.signature(Separator.__init__)
+        if "use_autocast" in sig.parameters:
+            kwargs["use_autocast"] = True
+        if "use_soundfile" in sig.parameters:
+            # Keep False so pydub/ffmpeg handles FLAC export cleanly from any codec (.opus, .mp3, .m4a, etc.)
+            kwargs["use_soundfile"] = False
+    except Exception:
+        pass
+    return Separator(**kwargs)
+
+def main():
+    input_audio = sys.argv[1]
+    output_dir = sys.argv[2]
+    models_dir = sys.argv[3]
+    mode = sys.argv[4].strip().lower()
+    base_name = sys.argv[5]
+    result_json = sys.argv[6]
+
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
+    work_dir = os.path.join(output_dir, f".karaocraft_sep_{int(time.time() * 1000)}")
+    os.makedirs(work_dir, exist_ok=True)
+
+    install_tqdm_hook()
+    emit_progress("init", 3, "Loading AI engine…")
+
+    from audio_separator.separator import Separator
+
+    FAST_KARAOKE_MODEL = "UVR_MDXNET_KARA_2.onnx"
+    KARAOKE_MODEL = "bs_roformer_karaoke_anvuew.ckpt"
+    FULL_VOCAL_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+
+    sep = build_separator(Separator, models_dir, work_dir)
+
+    final_vocal = os.path.join(output_dir, f"{base_name}_vocals.flac")
+    final_inst = os.path.join(output_dir, f"{base_name}_instrumental.flac")
+    final_backing = None
+
+    try:
+        if mode == "max":
+            # Pass 1: Full-Vocal BS-Roformer -> Pure Instrumental + All Vocals
+            PROGRESS_STATE.update({"start": 5, "end": 12, "stage": "downloading", "label": "Downloading model (1/2)…"})
+            emit_progress("downloading", 6, "Downloading model (1/2)…")
+            sep.load_model(model_filename=FULL_VOCAL_MODEL)
+
+            PROGRESS_STATE.update({"start": 12, "end": 44, "stage": "separating", "label": "Extracting instrumental (1/2)"})
+            emit_progress("separating", 12, "Extracting instrumental (1/2)")
+            pass1_files = resolve_outputs(sep.separate(input_audio), work_dir)
+            all_vocals_src, pure_inst_src = pick_vocal_and_other(pass1_files)
+            if not all_vocals_src or not pure_inst_src:
+                raise RuntimeError(f"Pass 1 did not produce both stems: {pass1_files}")
+
+            shutil.move(pure_inst_src, final_inst)
+
+            # Pass 2: BS-Roformer Karaoke (anvuew) on All Vocals -> Lead Vocals + Backing Vocals
+            PROGRESS_STATE.update({"start": 45, "end": 50, "stage": "downloading", "label": "Downloading model (2/2)…"})
+            emit_progress("downloading", 46, "Downloading model (2/2)…")
+            sep.load_model(model_filename=KARAOKE_MODEL)
+
+            PROGRESS_STATE.update({"start": 50, "end": 82, "stage": "separating", "label": "Splitting backing vocals (2/2)"})
+            emit_progress("separating", 50, "Splitting backing vocals (2/2)")
+            pass2_files = resolve_outputs(sep.separate(all_vocals_src), work_dir)
+            lead_src, backing_src = pick_vocal_and_other(pass2_files)
+            if not lead_src:
+                raise RuntimeError(f"Pass 2 did not produce lead vocal stem: {pass2_files}")
+
+            shutil.move(lead_src, final_vocal)
+            if backing_src and os.path.isfile(backing_src):
+                final_backing = os.path.join(output_dir, f"{base_name}_vocals_backing.flac")
+                shutil.move(backing_src, final_backing)
+        else:
+            # FAST (1-Pass): MDX-Net UVR-MDX-NET Karaoke 2 -> Lead Vocals + Karaoke Backing (Inst + Harmonies)
+            PROGRESS_STATE.update({"start": 5, "end": 16, "stage": "downloading", "label": "Downloading model…"})
+            emit_progress("downloading", 6, "Downloading model…")
+            sep.load_model(model_filename=FAST_KARAOKE_MODEL)
+
+            PROGRESS_STATE.update({"start": 16, "end": 82, "stage": "separating", "label": "Extracting stems"})
+            emit_progress("separating", 16, "Extracting stems")
+            out_files = resolve_outputs(sep.separate(input_audio), work_dir)
+            lead_src, karaoke_inst_src = pick_vocal_and_other(out_files)
+            if not lead_src or not karaoke_inst_src:
+                raise RuntimeError(f"Separation did not produce both stems: {out_files}")
+
+            shutil.move(lead_src, final_vocal)
+            shutil.move(karaoke_inst_src, final_inst)
+
+        emit_progress("finalizing", 84, "Loading stems…")
+        with open(result_json, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "outputDir": output_dir,
+                    "vocalPath": final_vocal,
+                    "instrumentalPath": final_inst,
+                    "backingVocalPath": final_backing,
+                    "modeUsed": "max" if mode == "max" else "fast",
+                },
+                f,
+            )
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+if __name__ == "__main__":
+    main()
+"#;
+
 #[tauri::command]
 fn check_system_capabilities() -> SystemCapabilities {
     let ffmpeg_found = search_binary(&["ffmpeg"]);
@@ -435,13 +692,234 @@ fn check_system_capabilities() -> SystemCapabilities {
         search_binary(&["mlx_whisper", "whisper"])
     };
 
+    let separator_available = find_separator_python().is_some();
+
     SystemCapabilities {
         ffmpeg_available: ffmpeg_found.is_some(),
         ffmpeg_path: ffmpeg_found.map(|(_, p)| p.to_string_lossy().to_string()),
         libass_available,
         whisper_available: whisper_found.is_some(),
         whisper_engine: whisper_found.map(|(name, _)| name),
+        separator_available,
     }
+}
+
+#[tauri::command]
+async fn separate_audio_stems(
+    app: tauri::AppHandle,
+    request: SeparateStemsRequest,
+) -> Result<SeparateStemsResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(py_path) = find_separator_python() else {
+            return Err(
+                "AI Stem Separator is not installed yet. Run First-Run Studio Setup to install audio-separator."
+                    .to_string(),
+            );
+        };
+
+        let stamp = unique_stamp();
+        let temp_dir = env::temp_dir().join(format!("karaocraft_sep_{}", stamp));
+        fs::create_dir_all(&temp_dir)
+            .map_err(|e| format!("Failed to create temp separation directory: {}", e))?;
+
+        let ext = request
+            .audio_ext
+            .trim_start_matches('.')
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>();
+        let safe_ext = if ext.is_empty() { "mp3".to_string() } else { ext };
+
+        let mut source_parent: Option<PathBuf> = None;
+        let mut derived_stem: Option<String> = None;
+
+        let input_audio_path = if let Some(ref direct) = request.audio_path {
+            let p = PathBuf::from(direct.trim());
+            if p.is_file() {
+                source_parent = p.parent().map(|d| d.to_path_buf());
+                derived_stem = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string());
+                p
+            } else {
+                let fallback = temp_dir.join(format!("input.{}", safe_ext));
+                let bytes = decode_base64(&request.audio_base64)?;
+                fs::write(&fallback, bytes)
+                    .map_err(|e| format!("Failed to write temp audio for separation: {}", e))?;
+                fallback
+            }
+        } else {
+            let fallback = temp_dir.join(format!("input.{}", safe_ext));
+            let bytes = decode_base64(&request.audio_base64)?;
+            fs::write(&fallback, bytes)
+                .map_err(|e| format!("Failed to write temp audio for separation: {}", e))?;
+            fallback
+        };
+
+        let raw_base = derived_stem
+            .or_else(|| request.song_title.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| format!("KaraoCraft_Song_{}", stamp));
+        let base_name = sanitize_filename(&raw_base);
+
+        // Save in a sibling "<SongName> Stems/" folder next to the source song (fallback to app support)
+        let output_dir = if let Some(parent) = source_parent {
+            parent.join(format!("{} Stems", base_name))
+        } else {
+            app_runtime_dir().join("stems").join(&base_name)
+        };
+        fs::create_dir_all(&output_dir)
+            .map_err(|e| format!("Failed to create stems output folder '{}': {}", output_dir.display(), e))?;
+
+        let models_dir = app_runtime_dir().join("models");
+        fs::create_dir_all(&models_dir)
+            .map_err(|e| format!("Failed to create models cache directory: {}", e))?;
+
+        let script_path = temp_dir.join("separate_stems.py");
+        let result_json_path = temp_dir.join("result.json");
+        fs::write(&script_path, STEM_SEPARATOR_SCRIPT)
+            .map_err(|e| format!("Failed to write separator script: {}", e))?;
+
+        let mode_arg = if request.mode.trim().eq_ignore_ascii_case("max") {
+            "max"
+        } else {
+            "fast"
+        };
+
+        let bin_dir = app_runtime_dir().join("bin");
+        let existing_path = env::var("PATH").unwrap_or_default();
+        let enriched_path = format!(
+            "{}:/opt/homebrew/bin:/usr/local/bin:{}",
+            bin_dir.display(),
+            existing_path
+        );
+
+        let mut child = Command::new(&py_path)
+            .env("PATH", &enriched_path)
+            .env("PYTHONUNBUFFERED", "1")
+            .arg(&script_path)
+            .arg(&input_audio_path)
+            .arg(&output_dir)
+            .arg(&models_dir)
+            .arg(mode_arg)
+            .arg(&base_name)
+            .arg(&result_json_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to launch AI stem separator: {}", e))?;
+
+        let stderr_handle = child.stderr.take().map(|err_pipe| {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let mut reader = BufReader::new(err_pipe);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.push_str(&line);
+                    line.clear();
+                }
+                buf
+            })
+        });
+
+        if let Some(stdout_pipe) = child.stdout.take() {
+            let reader = BufReader::new(stdout_pipe);
+            for line in reader.lines().flatten() {
+                if let Some(json_str) = line.strip_prefix("PROGRESS:") {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        let stage = val
+                            .get("stage")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("separating")
+                            .to_string();
+                        let percent = val
+                            .get("percent")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            .min(100) as u8;
+                        let message = val
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Extracting stems...")
+                            .to_string();
+                        let _ = app.emit(
+                            "separation-progress",
+                            SeparationProgressEvent {
+                                stage,
+                                percent,
+                                message,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed waiting for AI stem separator: {}", e))?;
+        let stderr_text = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+
+        if !status.success() || !result_json_path.is_file() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            let tail: String = stderr_text
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(if tail.trim().is_empty() {
+                "AI stem separation failed unexpectedly.".to_string()
+            } else {
+                format!("AI stem separation failed:\n{}", tail)
+            });
+        }
+
+        let raw_json = fs::read_to_string(&result_json_path)
+            .map_err(|e| format!("Failed to read separator output metadata: {}", e))?;
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw_json)
+            .map_err(|e| format!("Failed to parse separator output metadata: {}", e))?;
+
+        let vocal_path = parsed
+            .get("vocalPath")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Separator did not return a vocal stem path.".to_string())?
+            .to_string();
+        let instrumental_path = parsed
+            .get("instrumentalPath")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Separator did not return an instrumental stem path.".to_string())?
+            .to_string();
+        let backing_vocal_path = parsed
+            .get("backingVocalPath")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mode_used = parsed
+            .get("modeUsed")
+            .and_then(|v| v.as_str())
+            .unwrap_or(mode_arg)
+            .to_string();
+
+        Ok(SeparateStemsResponse {
+            output_dir: output_dir.to_string_lossy().to_string(),
+            vocal_path,
+            instrumental_path,
+            backing_vocal_path,
+            mode_used,
+        })
+    })
+    .await
+    .map_err(|e| format!("Stem separation task panicked: {}", e))?
 }
 
 #[tauri::command]
@@ -1595,13 +2073,16 @@ async fn install_runtime_dependencies(app: tauri::AppHandle) -> Result<SystemCap
             }
         }
 
-        // Step 2: Ensure uv + Python 3.10 venv + torchaudio, uroman, pykakasi
-        emit_progress("python", 35, "Checking AI lyrics alignment runtime...");
-        if find_mms_python().is_none() {
+        // Step 2: Ensure uv + Python 3.12 venv + torchaudio, uroman, pykakasi & audio-separator
+        // (Python 3.12 ensures SciPy >= 1.16 wheels compatible with macOS 27+ strict dyld validation)
+        emit_progress("python", 30, "Checking AI alignment & stem separation runtimes...");
+        let need_mms = find_mms_python().is_none();
+        let need_sep = find_separator_python().is_none();
+        if need_mms || need_sep {
             let uv_bin = if let Some((_, existing_uv)) = search_binary(&["uv"]) {
                 existing_uv
             } else {
-                emit_progress("python", 42, "Installing lightweight Python package manager (uv)...");
+                emit_progress("python", 38, "Installing lightweight Python package manager (uv)...");
                 let install_cmd = format!(
                     "curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR='{}' sh",
                     bin_dir.display()
@@ -1614,41 +2095,166 @@ async fn install_runtime_dependencies(app: tauri::AppHandle) -> Result<SystemCap
                 return Err("Could not install uv package manager. Please check your internet connection.".to_string());
             }
 
-            emit_progress("python", 55, "Creating isolated Python 3.10 environment...");
-            let venv_status = Command::new(&uv_bin)
-                .env("PATH", &enriched_path)
-                .args(["venv", "--python", "3.10"])
-                .arg(&venv_dir)
-                .status()
-                .map_err(|e| format!("Failed to create Python venv: {}", e))?;
+            let venv_py = venv_dir.join("bin/python");
+            let venv_needs_recreate = if !venv_py.is_file() {
+                true
+            } else {
+                // Recreate legacy Python < 3.11 venvs so SciPy >= 1.16 can install cleanly on macOS 27+
+                !Command::new(&venv_py)
+                    .args(["-c", "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            };
 
-            if !venv_status.success() {
-                return Err("Failed to initialize Python 3.10 virtual environment.".to_string());
+            if venv_needs_recreate {
+                emit_progress("python", 46, "Creating isolated Python 3.12 environment...");
+                let venv_status = Command::new(&uv_bin)
+                    .env("PATH", &enriched_path)
+                    .args(["venv", "--clear", "--python", "3.12"])
+                    .arg(&venv_dir)
+                    .status()
+                    .map_err(|e| format!("Failed to create Python venv: {}", e))?;
+
+                if !venv_status.success() {
+                    return Err("Failed to initialize Python 3.12 virtual environment.".to_string());
+                }
             }
 
-            emit_progress(
-                "packages",
-                68,
-                "Installing PyTorch Audio & universal phonetic libraries (torchaudio, uroman, pykakasi)...",
-            );
-            let venv_py = venv_dir.join("bin/python");
-            let pip_status = Command::new(&uv_bin)
-                .env("PATH", &enriched_path)
-                .args([
-                    "pip",
-                    "install",
-                    "--python",
-                    &venv_py.to_string_lossy(),
-                    "torchaudio",
-                    "uroman",
-                    "pykakasi",
-                    "numpy",
-                ])
-                .status()
-                .map_err(|e| format!("Failed to install AI packages: {}", e))?;
+            if need_mms && need_sep {
+                emit_progress(
+                    "packages",
+                    58,
+                    "Installing PyTorch Audio, phonetic aligner & BS-Roformer stem separator...",
+                );
+                let unified = Command::new(&uv_bin)
+                    .env("PATH", &enriched_path)
+                    .args([
+                        "pip",
+                        "install",
+                        "--python",
+                        &venv_py.to_string_lossy(),
+                        "audio-separator[cpu]",
+                        "scipy>=1.16",
+                        "audioread",
+                        "torchaudio",
+                        "uroman",
+                        "pykakasi",
+                        "numpy",
+                    ])
+                    .status();
 
-            if !pip_status.success() {
-                return Err("Failed to install torchaudio and phonetic alignment packages.".to_string());
+                if !unified.map(|s| s.success()).unwrap_or(false) {
+                    // Fallback: install MMS_FA in main venv and audio-separator in dedicated separator-venv
+                    let mms_ok = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args([
+                            "pip",
+                            "install",
+                            "--python",
+                            &venv_py.to_string_lossy(),
+                            "torchaudio",
+                            "uroman",
+                            "pykakasi",
+                            "numpy",
+                        ])
+                        .status()
+                        .map_err(|e| format!("Failed to install alignment packages: {}", e))?;
+                    if !mms_ok.success() {
+                        return Err("Failed to install torchaudio and phonetic alignment packages.".to_string());
+                    }
+
+                    let sep_venv_dir = runtime_dir.join("separator-venv");
+                    let sep_py = sep_venv_dir.join("bin/python");
+                    let _ = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args(["venv", "--clear", "--python", "3.12"])
+                        .arg(&sep_venv_dir)
+                        .status();
+                    let sep_ok = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args([
+                            "pip",
+                            "install",
+                            "--python",
+                            &sep_py.to_string_lossy(),
+                            "audio-separator[cpu]",
+                            "scipy>=1.16",
+                            "audioread",
+                        ])
+                        .status()
+                        .map_err(|e| format!("Failed to install AI stem separator: {}", e))?;
+                    if !sep_ok.success() {
+                        return Err("Failed to install audio-separator package.".to_string());
+                    }
+                }
+            } else if need_mms {
+                emit_progress(
+                    "packages",
+                    60,
+                    "Installing PyTorch Audio & universal phonetic libraries (torchaudio, uroman, pykakasi)...",
+                );
+                let pip_status = Command::new(&uv_bin)
+                    .env("PATH", &enriched_path)
+                    .args([
+                        "pip",
+                        "install",
+                        "--python",
+                        &venv_py.to_string_lossy(),
+                        "torchaudio",
+                        "uroman",
+                        "pykakasi",
+                        "numpy",
+                    ])
+                    .status()
+                    .map_err(|e| format!("Failed to install AI packages: {}", e))?;
+
+                if !pip_status.success() {
+                    return Err("Failed to install torchaudio and phonetic alignment packages.".to_string());
+                }
+            } else if need_sep {
+                emit_progress(
+                    "packages",
+                    65,
+                    "Installing AI Stem Separator (audio-separator for BS-Roformer)...",
+                );
+                let sep_ok = Command::new(&uv_bin)
+                    .env("PATH", &enriched_path)
+                    .args([
+                        "pip",
+                        "install",
+                        "--python",
+                        &venv_py.to_string_lossy(),
+                        "audio-separator[cpu]",
+                        "scipy>=1.16",
+                        "audioread",
+                    ])
+                    .status();
+                if !sep_ok.map(|s| s.success()).unwrap_or(false) {
+                    let sep_venv_dir = runtime_dir.join("separator-venv");
+                    let sep_py = sep_venv_dir.join("bin/python");
+                    let _ = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args(["venv", "--clear", "--python", "3.12"])
+                        .arg(&sep_venv_dir)
+                        .status();
+                    let fallback_ok = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args([
+                            "pip",
+                            "install",
+                            "--python",
+                            &sep_py.to_string_lossy(),
+                            "audio-separator[cpu]",
+                            "scipy>=1.16",
+                            "audioread",
+                        ])
+                        .status()
+                        .map_err(|e| format!("Failed to install AI stem separator: {}", e))?;
+                    if !fallback_ok.success() {
+                        return Err("Failed to install audio-separator package.".to_string());
+                    }
+                }
             }
         }
 
@@ -1682,6 +2288,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_system_capabilities,
             transcribe_whisper_words,
+            separate_audio_stems,
             render_karaoke_mp4,
             reveal_in_finder,
             resolve_local_audio_path,
