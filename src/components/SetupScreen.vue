@@ -1,18 +1,55 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, onMounted, onBeforeUnmount } from 'vue';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
+import type { UnlistenFn } from '@tauri-apps/api/event';
 import { useProjectStore } from '../stores/projectStore';
 import {
   CheckCircle2,
-  HelpCircle,
   Loader2,
   Eraser,
   CaseSensitive,
   CaseUpper,
+  Zap,
+  Music,
+  Mic,
+  Sparkles,
 } from '@lucide/vue';
 
 const project = useProjectStore();
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const isDragging = ref(false);
+let unlistenDragDrop: UnlistenFn | null = null;
+
+const AUDIO_EXT_RE = /\.(wav|mp3|m4a|flac|aac|ogg|opus|mp4|mov|mkv|webm|aif|aiff)$/i;
+
+onMounted(async () => {
+  if (!project.isTauriEnv) return;
+  try {
+    unlistenDragDrop = await getCurrentWebview().onDragDropEvent(async (event) => {
+      if (project.isBusySubmitting) return;
+      const { type } = event.payload;
+      if (type === 'enter' || type === 'over') {
+        isDragging.value = true;
+      } else if (type === 'leave') {
+        isDragging.value = false;
+      } else if (type === 'drop') {
+        isDragging.value = false;
+        const paths = event.payload.paths;
+        if (!paths || paths.length === 0) return;
+        const audioPath = paths.find((p) => AUDIO_EXT_RE.test(p)) || paths[0];
+        if (audioPath) {
+          await project.loadVocalFromPath(audioPath);
+        }
+      }
+    });
+  } catch {
+    // Ignore outside Tauri
+  }
+});
+
+onBeforeUnmount(() => {
+  unlistenDragDrop?.();
+});
 
 function formatDuration(sec: number): string {
   if (!sec || !Number.isFinite(sec)) return '0:00';
@@ -51,11 +88,13 @@ async function handleDrop(e: DragEvent) {
     <div class="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-8 lg:items-stretch">
       <!-- Left Column (50%): Step 1 (Select Vocal Stem) & Step 2 (Title & Artist) -->
       <div class="flex flex-col justify-between gap-5">
-        <!-- 1. Select Vocal Stem File -->
+        <!-- 1. Select Song Audio -->
         <section>
           <div class="text-center mb-2">
-            <h2 class="text-2xl font-bold text-slate-900">1. Select Vocal Stem File</h2>
-            <p class="text-sm font-medium text-slate-700 mt-0.5">*Isolated Vocals Recommended</p>
+            <h2 class="text-2xl font-bold text-slate-900">1. Select Song Audio</h2>
+            <p class="text-sm font-medium text-slate-700 mt-0.5">
+              Drop a full song or isolated vocal stem
+            </p>
           </div>
 
           <div class="bg-white rounded-3xl shadow-card border border-slate-200/90 p-4">
@@ -83,7 +122,7 @@ async function handleDrop(e: DragEvent) {
               <!-- Decoding Spinner -->
               <div v-if="project.isDecodingAudio" class="space-y-2 py-1">
                 <Loader2 class="w-8 h-8 text-brand-purple animate-spin mx-auto" />
-                <p class="text-base font-semibold text-slate-800">Decoding vocal waveform...</p>
+                <p class="text-base font-semibold text-slate-800">Analyzing audio waveform...</p>
               </div>
 
               <!-- Loaded File State -->
@@ -105,8 +144,9 @@ async function handleDrop(e: DragEvent) {
                 <div class="pt-0.5">
                   <button
                     type="button"
+                    :disabled="project.isBusySubmitting"
                     @click="handleBrowseVocal"
-                    class="bg-brand-purple hover:bg-brand-purpleHover text-white font-semibold text-sm px-5 py-2 rounded-xl shadow-sm transition-colors"
+                    class="bg-brand-purple hover:bg-brand-purpleHover disabled:opacity-50 text-white font-semibold text-sm px-5 py-2 rounded-xl shadow-sm transition-colors cursor-pointer disabled:cursor-not-allowed"
                   >
                     Change File
                   </button>
@@ -123,31 +163,137 @@ async function handleDrop(e: DragEvent) {
                   Browse
                 </button>
                 <div class="text-sm text-slate-500 leading-snug">
-                  <div>Drop Vocal Stem Audio</div>
+                  <div>Drop Song or Vocal Audio</div>
                   <div class="text-xs text-slate-400 mt-0.5">(.wav, .mp3, .m4a, .flac, ...)</div>
                 </div>
               </div>
             </div>
 
-            <!-- Error Banner -->
+            <!-- Audio Error Banner -->
             <p v-if="project.audioError" class="mt-2 text-xs font-medium text-red-600 text-center">
               {{ project.audioError }}
             </p>
 
-            <!-- UVR Vocal Stem Helper Callout (Two-line layout) -->
-            <div class="mt-3 bg-purple-50/80 border border-purple-200/80 rounded-xl px-4 py-2.5 flex items-center justify-between gap-3">
+            <!-- Contextual Built-In Stem Extraction Bar -->
+            <!-- State A: Empty (before file loaded) -->
+            <div
+              v-if="!project.vocalFile"
+              class="mt-3 bg-purple-50/80 border border-purple-200/80 rounded-xl px-4 py-2.5 flex items-center gap-2.5"
+            >
+              <Sparkles class="w-4 h-4 text-brand-purple shrink-0" />
               <div class="text-xs text-slate-700 leading-snug">
-                <div><strong class="text-slate-900">Have a full song?</strong></div>
-                <div>Extract clean Vocal &amp; Instrumental stems free with <strong>UVR5</strong>.</div>
+                <strong class="text-slate-900">Built-in AI Stem Extraction (MDX-Net &amp; BS-Roformer):</strong>
+                Drop any full song — KaraoCraft auto-detects and extracts Lead Vocals &amp; Backing tracks locally.
+              </div>
+            </div>
+
+            <!-- State B: Full Song Detected (or user chose to separate) -> FAST / MAX Toggle -->
+            <div
+              v-else-if="project.needsStemSeparation"
+              class="mt-3 bg-purple-50/75 border border-purple-200/90 rounded-xl p-3 space-y-2.5"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <div class="inline-flex items-center gap-1.5 text-xs font-bold text-slate-900">
+                  <Music class="w-3.5 h-3.5 text-brand-purple shrink-0" />
+                  <span>
+                    {{
+                      project.detectedAudioType === 'full_mix'
+                        ? 'Full Song Detected · Auto-Extract Stems'
+                        : 'AI Stem Extraction Enabled'
+                    }}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  :disabled="project.isBusySubmitting"
+                  @click="project.needsStemSeparation = false"
+                  class="text-[11px] font-semibold text-slate-500 hover:text-brand-purple underline underline-offset-2 transition-colors cursor-pointer disabled:opacity-50 shrink-0"
+                >
+                  Already vocals? Skip
+                </button>
+              </div>
+
+              <!-- FAST / MAX Segmented Toggle (narrower FAST, wider MAX so both stay cleanly on 2 lines) -->
+              <div class="grid grid-cols-[minmax(0,0.82fr)_minmax(0,1.18fr)] gap-2">
+                <button
+                  type="button"
+                  :disabled="project.isBusySubmitting"
+                  @click="project.separationQuality = 'fast'"
+                  class="rounded-xl px-3 py-2 text-left transition-all border cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed min-w-0"
+                  :class="
+                    project.separationQuality === 'fast'
+                      ? 'bg-brand-purple text-white border-brand-purple shadow-sm'
+                      : 'bg-white text-slate-800 border-slate-200 hover:border-purple-300 hover:bg-purple-50/40'
+                  "
+                >
+                  <div class="flex items-center gap-1.5 font-bold text-xs tracking-wide">
+                    <Zap class="w-3.5 h-3.5 shrink-0" />
+                    <span>FAST</span>
+                  </div>
+                  <div
+                    class="text-[11px] mt-0.5 leading-tight whitespace-nowrap truncate"
+                    :class="project.separationQuality === 'fast' ? 'text-purple-100' : 'text-slate-500'"
+                  >
+                    MDX-Net Karaoke 2 · Quick
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  :disabled="project.isBusySubmitting"
+                  @click="project.separationQuality = 'max'"
+                  class="rounded-xl px-3 py-2 text-left transition-all border cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed min-w-0"
+                  :class="
+                    project.separationQuality === 'max'
+                      ? 'bg-brand-purple text-white border-brand-purple shadow-sm'
+                      : 'bg-white text-slate-800 border-slate-200 hover:border-purple-300 hover:bg-purple-50/40'
+                  "
+                >
+                  <div class="flex items-center gap-1.5 font-bold text-xs tracking-wide">
+                    <Music class="w-3.5 h-3.5 shrink-0" />
+                    <span>MAX</span>
+                  </div>
+                  <div
+                    class="text-[11px] mt-0.5 leading-tight whitespace-nowrap truncate"
+                    :class="project.separationQuality === 'max' ? 'text-purple-100' : 'text-slate-500'"
+                  >
+                    BS-Roformer · 3 Stems (Inst + Backing)
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            <!-- State C: Isolated Vocal Detected (or separation skipped) -->
+            <div
+              v-else
+              class="mt-3 bg-emerald-50/80 border border-emerald-200/90 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-2"
+            >
+              <div class="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-950">
+                <Mic class="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                <span>
+                  {{
+                    project.detectedAudioType === 'isolated_vocal'
+                      ? 'Isolated Vocal Detected · Ready to sync'
+                      : 'Stem extraction skipped · Using audio directly'
+                  }}
+                </span>
               </div>
               <button
                 type="button"
-                @click="project.showUvrGuideModal = true"
-                class="shrink-0 inline-flex items-center gap-1 text-xs font-bold text-brand-purple hover:underline whitespace-nowrap"
+                :disabled="project.isBusySubmitting"
+                @click="project.needsStemSeparation = true"
+                class="text-[11px] font-bold text-brand-purple hover:underline underline-offset-2 transition-colors cursor-pointer disabled:opacity-50 shrink-0 whitespace-nowrap"
               >
-                <HelpCircle class="w-3.5 h-3.5" />
-                <span>How-To</span>
+                Separate stems
               </button>
+            </div>
+
+            <!-- Separation Error Banner -->
+            <div
+              v-if="project.separationError"
+              class="mt-2.5 bg-amber-50 border border-amber-300 rounded-xl px-3.5 py-2 text-xs text-amber-950 whitespace-pre-line"
+            >
+              {{ project.separationError }}
             </div>
           </div>
         </section>
@@ -268,23 +414,49 @@ async function handleDrop(e: DragEvent) {
         <div class="mt-4">
           <button
             type="button"
-            :disabled="!project.canSubmit || project.isAligning"
+            :disabled="!project.canSubmit || project.isBusySubmitting"
             @click="project.submitSetup()"
-            class="w-full rounded-2xl py-3 px-8 text-lg font-bold text-white shadow-md transition-all flex items-center justify-center gap-2.5"
+            class="relative overflow-hidden w-full rounded-2xl py-3 px-6 text-lg font-bold shadow-md transition-all flex items-center justify-center"
             :class="
-              project.canSubmit && !project.isAligning
-                ? 'bg-brand-purple hover:bg-brand-purpleHover cursor-pointer active:scale-[0.99]'
-                : 'bg-slate-300 text-slate-500 cursor-not-allowed shadow-none'
+              project.isBusySubmitting
+                ? 'bg-slate-400/90 text-white cursor-wait shadow-sm'
+                : project.canSubmit
+                  ? 'bg-brand-purple hover:bg-brand-purpleHover text-white cursor-pointer active:scale-[0.99]'
+                  : 'bg-slate-300 text-slate-500 cursor-not-allowed shadow-none'
             "
           >
-            <Loader2 v-if="project.isAligning" class="w-5 h-5 animate-spin" />
-            <span>{{ project.isAligning ? project.alignmentMessage || 'Syncing lyrics to song...' : 'Submit' }}</span>
+            <!-- Croonify-style vibrant linear progress fill over muted disabled track -->
+            <div
+              v-if="project.isBusySubmitting"
+              class="absolute inset-y-0 left-0 bg-brand-purple transition-[width] duration-300 ease-out"
+              :style="{ width: `${Math.max(4, Math.min(100, project.submitProgress))}%` }"
+            ></div>
+
+            <!-- Foreground label + circular spinner + pinned percentage -->
+            <span class="relative z-10 flex items-center justify-center gap-2.5 max-w-full">
+              <Loader2 v-if="project.isBusySubmitting" class="w-5 h-5 animate-spin shrink-0" />
+              <span class="truncate">
+                {{
+                  project.isBusySubmitting
+                    ? project.submitStatusMessage || project.alignmentMessage || 'Processing…'
+                    : project.needsStemSeparation
+                      ? `Extract (${project.separationQuality.toUpperCase()}) & Submit`
+                      : 'Submit'
+                }}
+              </span>
+              <span
+                v-if="project.isBusySubmitting"
+                class="shrink-0 tabular-nums text-white/95 font-bold"
+              >
+                {{ Math.round(project.submitProgress) }}%
+              </span>
+            </span>
           </button>
           <p
             class="text-center text-xs text-slate-500 mt-1.5 whitespace-nowrap truncate"
             :class="!project.vocalFile || !project.rawLyrics.trim() ? 'opacity-100' : 'opacity-0 select-none'"
           >
-            Select a vocal stem audio file and paste lyrics above to continue.
+            Select a song or vocal audio file and paste lyrics above to continue.
           </p>
         </div>
       </div>

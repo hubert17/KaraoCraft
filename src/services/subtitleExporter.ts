@@ -844,6 +844,10 @@ export interface KaraoCraftProjectData {
   backingVocalFilePath?: string;
   instrumentalGainDb?: number;
   backingVocalGainDb?: number;
+  melodyGuideStyle?: 'none' | 'flute' | 'synth';
+  melodyGuideFileName?: string;
+  melodyGuideFilePath?: string;
+  melodyGuideGainDb?: number;
   bgImageFileName?: string;
   bgImageFilePath?: string;
   lyricsOffsetSec?: number;

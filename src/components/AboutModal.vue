@@ -107,9 +107,9 @@ async function openExternal(url: string) {
           <div class="bg-slate-50 border border-slate-200/90 rounded-xl p-3.5 flex items-start gap-3">
             <Sparkles class="w-4 h-4 text-brand-purple shrink-0 mt-0.5" />
             <div>
-              <strong class="text-slate-900">Audio Engine &amp; Stem Separation Companion:</strong>
+              <strong class="text-slate-900">Built-In AI Stem Separation &amp; Audio Engine:</strong>
               <div class="text-slate-600 text-xs mt-0.5 leading-relaxed">
-                <strong>Web Audio API</strong> sample-accurate dual-stem engine, designed to pair with <strong>Ultimate Vocal Remover (UVR5)</strong> &amp; Demucs / MDX-Net stems, inspired by the <strong>Croonify</strong> studio workflow.
+                <strong>BS-Roformer</strong> local GPU stem extraction (powered by <strong>audio-separator</strong>) paired with a sample-accurate <strong>Web Audio API</strong> 3-stem mixer, inspired by the <strong>Croonify</strong> studio workflow.
               </div>
             </div>
           </div>

@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
@@ -17,6 +18,14 @@ pub struct SetupProgressEvent {
     pub message: String,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SeparationProgressEvent {
+    pub stage: String,
+    pub percent: u8,
+    pub message: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemCapabilities {
@@ -25,6 +34,54 @@ pub struct SystemCapabilities {
     pub libass_available: bool,
     pub whisper_available: bool,
     pub whisper_engine: Option<String>,
+    pub separator_available: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeparateStemsRequest {
+    #[serde(default)]
+    pub audio_path: Option<String>,
+    #[serde(default)]
+    pub audio_base64: String,
+    pub audio_ext: String,
+    pub mode: String,
+    #[serde(default)]
+    pub song_title: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeparateStemsResponse {
+    pub output_dir: String,
+    pub vocal_path: String,
+    pub instrumental_path: String,
+    pub backing_vocal_path: Option<String>,
+    pub mode_used: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateMelodyGuideRequest {
+    #[serde(default)]
+    pub vocal_path: Option<String>,
+    #[serde(default)]
+    pub vocal_base64: String,
+    pub vocal_ext: String,
+    #[serde(default)]
+    pub instrumental_path: Option<String>,
+    pub style: String, // "flute" | "synth"
+    #[serde(default)]
+    pub song_title: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateMelodyGuideResponse {
+    pub file_path: String,
+    pub file_name: String,
+    pub style: String,
+    pub engine_used: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -63,6 +120,14 @@ pub struct RenderMp4Request {
     pub backing_vocal_ext: Option<String>,
     #[serde(default)]
     pub backing_vocal_gain_db: Option<f64>,
+    #[serde(default)]
+    pub melody_guide_path: Option<String>,
+    #[serde(default)]
+    pub melody_guide_base64: Option<String>,
+    #[serde(default)]
+    pub melody_guide_ext: Option<String>,
+    #[serde(default)]
+    pub melody_guide_gain_db: Option<f64>,
     pub bg_color: String,
     pub bg_image_base64: Option<String>,
     pub bg_image_ext: Option<String>,
@@ -420,6 +485,230 @@ if __name__ == "__main__":
     main()
 "#;
 
+fn find_separator_python() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = vec![
+        app_runtime_dir().join("venv/bin/python"),
+        app_runtime_dir().join("venv/bin/python3"),
+        app_runtime_dir().join("separator-venv/bin/python"),
+        app_runtime_dir().join("separator-venv/bin/python3"),
+    ];
+    if let Ok(home) = env::var("HOME") {
+        let home_path = PathBuf::from(&home);
+        candidates.push(home_path.join(".local/pipx/venvs/audio-separator/bin/python"));
+        candidates.push(home_path.join(".local/pipx/venvs/openai-whisper/bin/python"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/python3"));
+    candidates.push(PathBuf::from("/usr/local/bin/python3"));
+
+    for py in candidates {
+        if !py.is_file() {
+            continue;
+        }
+        if let Ok(status) = Command::new(&py)
+            .args(["-c", "from audio_separator.separator import Separator"])
+            .status()
+        {
+            if status.success() {
+                return Some(py);
+            }
+        }
+    }
+    None
+}
+
+const STEM_SEPARATOR_SCRIPT: &str = r#"import inspect, json, logging, os, shutil, sys, time
+
+# Track active progress window so tqdm updates map cleanly into 0..84%
+PROGRESS_STATE = {
+    "start": 5,
+    "end": 80,
+    "stage": "separating",
+    "label": "Extracting stems",
+    "last_pct": -1,
+    "last_ts": 0.0,
+}
+
+def emit_progress(stage, percent, message):
+    pct = max(0, min(100, int(round(percent))))
+    PROGRESS_STATE["last_pct"] = max(PROGRESS_STATE["last_pct"], pct)
+    payload = {"stage": stage, "percent": PROGRESS_STATE["last_pct"], "message": message}
+    sys.stdout.write("PROGRESS:" + json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+def install_tqdm_hook():
+    try:
+        import tqdm
+        import tqdm.auto as tqdm_auto
+    except Exception:
+        return
+
+    OrigTqdm = tqdm.tqdm
+
+    class KaraoCraftTqdm(OrigTqdm):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("disable", False)
+            super().__init__(*args, **kwargs)
+
+        def update(self, n=1):
+            res = super().update(n)
+            total = getattr(self, "total", None)
+            if total and total > 0:
+                frac = max(0.0, min(1.0, float(self.n) / float(total)))
+                s = PROGRESS_STATE["start"]
+                e = PROGRESS_STATE["end"]
+                mapped = s + frac * (e - s)
+                now = time.monotonic()
+                if int(mapped) >= PROGRESS_STATE["last_pct"] + 2 or (now - PROGRESS_STATE["last_ts"] >= 1.2 and int(mapped) > PROGRESS_STATE["last_pct"]):
+                    PROGRESS_STATE["last_ts"] = now
+                    emit_progress(
+                        PROGRESS_STATE["stage"],
+                        mapped,
+                        PROGRESS_STATE["label"],
+                    )
+            return res
+
+    tqdm.tqdm = KaraoCraftTqdm
+    tqdm_auto.tqdm = KaraoCraftTqdm
+
+def resolve_outputs(files, base_dir):
+    resolved = []
+    for f in files or []:
+        p = f if os.path.isabs(f) else os.path.join(base_dir, f)
+        if os.path.isfile(p):
+            resolved.append(p)
+    return resolved
+
+def pick_vocal_and_other(paths):
+    vocal = None
+    other = None
+    for p in paths:
+        name = os.path.basename(p).lower()
+        if "(vocals)" in name or "_vocals" in name or "(lead" in name:
+            vocal = p
+        elif "(instrumental)" in name or "(other)" in name or "(no_vocals)" in name or "(backing" in name:
+            other = p
+    if vocal is None and paths:
+        vocal = paths[0]
+    if other is None:
+        for p in paths:
+            if p != vocal:
+                other = p
+                break
+    return vocal, other
+
+def build_separator(Separator, models_dir, work_dir):
+    kwargs = {
+        "log_level": logging.WARNING,
+        "model_file_dir": models_dir,
+        "output_dir": work_dir,
+        "output_format": "FLAC",
+    }
+    try:
+        sig = inspect.signature(Separator.__init__)
+        if "use_autocast" in sig.parameters:
+            kwargs["use_autocast"] = True
+        if "use_soundfile" in sig.parameters:
+            # Keep False so pydub/ffmpeg handles FLAC export cleanly from any codec (.opus, .mp3, .m4a, etc.)
+            kwargs["use_soundfile"] = False
+    except Exception:
+        pass
+    return Separator(**kwargs)
+
+def main():
+    input_audio = sys.argv[1]
+    output_dir = sys.argv[2]
+    models_dir = sys.argv[3]
+    mode = sys.argv[4].strip().lower()
+    base_name = sys.argv[5]
+    result_json = sys.argv[6]
+
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
+    work_dir = os.path.join(output_dir, f".karaocraft_sep_{int(time.time() * 1000)}")
+    os.makedirs(work_dir, exist_ok=True)
+
+    install_tqdm_hook()
+    emit_progress("init", 3, "Loading AI engine…")
+
+    from audio_separator.separator import Separator
+
+    FAST_KARAOKE_MODEL = "UVR_MDXNET_KARA_2.onnx"
+    KARAOKE_MODEL = "bs_roformer_karaoke_anvuew.ckpt"
+    FULL_VOCAL_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+
+    sep = build_separator(Separator, models_dir, work_dir)
+
+    final_vocal = os.path.join(output_dir, f"{base_name}_vocals.flac")
+    final_inst = os.path.join(output_dir, f"{base_name}_instrumental.flac")
+    final_backing = None
+
+    try:
+        if mode == "max":
+            # Pass 1: Full-Vocal BS-Roformer -> Pure Instrumental + All Vocals
+            PROGRESS_STATE.update({"start": 5, "end": 12, "stage": "downloading", "label": "Downloading model (1/2)…"})
+            emit_progress("downloading", 6, "Downloading model (1/2)…")
+            sep.load_model(model_filename=FULL_VOCAL_MODEL)
+
+            PROGRESS_STATE.update({"start": 12, "end": 44, "stage": "separating", "label": "Extracting instrumental (1/2)"})
+            emit_progress("separating", 12, "Extracting instrumental (1/2)")
+            pass1_files = resolve_outputs(sep.separate(input_audio), work_dir)
+            all_vocals_src, pure_inst_src = pick_vocal_and_other(pass1_files)
+            if not all_vocals_src or not pure_inst_src:
+                raise RuntimeError(f"Pass 1 did not produce both stems: {pass1_files}")
+
+            shutil.move(pure_inst_src, final_inst)
+
+            # Pass 2: BS-Roformer Karaoke (anvuew) on All Vocals -> Lead Vocals + Backing Vocals
+            PROGRESS_STATE.update({"start": 45, "end": 50, "stage": "downloading", "label": "Downloading model (2/2)…"})
+            emit_progress("downloading", 46, "Downloading model (2/2)…")
+            sep.load_model(model_filename=KARAOKE_MODEL)
+
+            PROGRESS_STATE.update({"start": 50, "end": 82, "stage": "separating", "label": "Splitting backing vocals (2/2)"})
+            emit_progress("separating", 50, "Splitting backing vocals (2/2)")
+            pass2_files = resolve_outputs(sep.separate(all_vocals_src), work_dir)
+            lead_src, backing_src = pick_vocal_and_other(pass2_files)
+            if not lead_src:
+                raise RuntimeError(f"Pass 2 did not produce lead vocal stem: {pass2_files}")
+
+            shutil.move(lead_src, final_vocal)
+            if backing_src and os.path.isfile(backing_src):
+                final_backing = os.path.join(output_dir, f"{base_name}_vocals_backing.flac")
+                shutil.move(backing_src, final_backing)
+        else:
+            # FAST (1-Pass): MDX-Net UVR-MDX-NET Karaoke 2 -> Lead Vocals + Karaoke Backing (Inst + Harmonies)
+            PROGRESS_STATE.update({"start": 5, "end": 16, "stage": "downloading", "label": "Downloading model…"})
+            emit_progress("downloading", 6, "Downloading model…")
+            sep.load_model(model_filename=FAST_KARAOKE_MODEL)
+
+            PROGRESS_STATE.update({"start": 16, "end": 82, "stage": "separating", "label": "Extracting stems"})
+            emit_progress("separating", 16, "Extracting stems")
+            out_files = resolve_outputs(sep.separate(input_audio), work_dir)
+            lead_src, karaoke_inst_src = pick_vocal_and_other(out_files)
+            if not lead_src or not karaoke_inst_src:
+                raise RuntimeError(f"Separation did not produce both stems: {out_files}")
+
+            shutil.move(lead_src, final_vocal)
+            shutil.move(karaoke_inst_src, final_inst)
+
+        emit_progress("finalizing", 84, "Loading stems…")
+        with open(result_json, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "outputDir": output_dir,
+                    "vocalPath": final_vocal,
+                    "instrumentalPath": final_inst,
+                    "backingVocalPath": final_backing,
+                    "modeUsed": "max" if mode == "max" else "fast",
+                },
+                f,
+            )
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+if __name__ == "__main__":
+    main()
+"#;
+
 #[tauri::command]
 fn check_system_capabilities() -> SystemCapabilities {
     let ffmpeg_found = search_binary(&["ffmpeg"]);
@@ -435,13 +724,865 @@ fn check_system_capabilities() -> SystemCapabilities {
         search_binary(&["mlx_whisper", "whisper"])
     };
 
+    let separator_available = find_separator_python().is_some();
+
     SystemCapabilities {
         ffmpeg_available: ffmpeg_found.is_some(),
         ffmpeg_path: ffmpeg_found.map(|(_, p)| p.to_string_lossy().to_string()),
         libass_available,
         whisper_available: whisper_found.is_some(),
         whisper_engine: whisper_found.map(|(name, _)| name),
+        separator_available,
     }
+}
+
+#[tauri::command]
+async fn separate_audio_stems(
+    app: tauri::AppHandle,
+    request: SeparateStemsRequest,
+) -> Result<SeparateStemsResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(py_path) = find_separator_python() else {
+            return Err(
+                "AI Stem Separator is not installed yet. Run First-Run Studio Setup to install audio-separator."
+                    .to_string(),
+            );
+        };
+
+        let stamp = unique_stamp();
+        let temp_dir = env::temp_dir().join(format!("karaocraft_sep_{}", stamp));
+        fs::create_dir_all(&temp_dir)
+            .map_err(|e| format!("Failed to create temp separation directory: {}", e))?;
+
+        let ext = request
+            .audio_ext
+            .trim_start_matches('.')
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>();
+        let safe_ext = if ext.is_empty() { "mp3".to_string() } else { ext };
+
+        let mut source_parent: Option<PathBuf> = None;
+        let mut derived_stem: Option<String> = None;
+
+        let input_audio_path = if let Some(ref direct) = request.audio_path {
+            let p = PathBuf::from(direct.trim());
+            if p.is_file() {
+                source_parent = p.parent().map(|d| d.to_path_buf());
+                derived_stem = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string());
+                p
+            } else {
+                let fallback = temp_dir.join(format!("input.{}", safe_ext));
+                let bytes = decode_base64(&request.audio_base64)?;
+                fs::write(&fallback, bytes)
+                    .map_err(|e| format!("Failed to write temp audio for separation: {}", e))?;
+                fallback
+            }
+        } else {
+            let fallback = temp_dir.join(format!("input.{}", safe_ext));
+            let bytes = decode_base64(&request.audio_base64)?;
+            fs::write(&fallback, bytes)
+                .map_err(|e| format!("Failed to write temp audio for separation: {}", e))?;
+            fallback
+        };
+
+        let raw_base = derived_stem
+            .or_else(|| request.song_title.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| format!("KaraoCraft_Song_{}", stamp));
+        let base_name = sanitize_filename(&raw_base);
+
+        // Save in a sibling "<SongName> Stems/" folder next to the source song (fallback to app support)
+        let output_dir = if let Some(parent) = source_parent {
+            parent.join(format!("{} Stems", base_name))
+        } else {
+            app_runtime_dir().join("stems").join(&base_name)
+        };
+        fs::create_dir_all(&output_dir)
+            .map_err(|e| format!("Failed to create stems output folder '{}': {}", output_dir.display(), e))?;
+
+        let models_dir = app_runtime_dir().join("models");
+        fs::create_dir_all(&models_dir)
+            .map_err(|e| format!("Failed to create models cache directory: {}", e))?;
+
+        let script_path = temp_dir.join("separate_stems.py");
+        let result_json_path = temp_dir.join("result.json");
+        fs::write(&script_path, STEM_SEPARATOR_SCRIPT)
+            .map_err(|e| format!("Failed to write separator script: {}", e))?;
+
+        let mode_arg = if request.mode.trim().eq_ignore_ascii_case("max") {
+            "max"
+        } else {
+            "fast"
+        };
+
+        let bin_dir = app_runtime_dir().join("bin");
+        let existing_path = env::var("PATH").unwrap_or_default();
+        let enriched_path = format!(
+            "{}:/opt/homebrew/bin:/usr/local/bin:{}",
+            bin_dir.display(),
+            existing_path
+        );
+
+        let mut child = Command::new(&py_path)
+            .env("PATH", &enriched_path)
+            .env("PYTHONUNBUFFERED", "1")
+            .arg(&script_path)
+            .arg(&input_audio_path)
+            .arg(&output_dir)
+            .arg(&models_dir)
+            .arg(mode_arg)
+            .arg(&base_name)
+            .arg(&result_json_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to launch AI stem separator: {}", e))?;
+
+        let stderr_handle = child.stderr.take().map(|err_pipe| {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let mut reader = BufReader::new(err_pipe);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.push_str(&line);
+                    line.clear();
+                }
+                buf
+            })
+        });
+
+        if let Some(stdout_pipe) = child.stdout.take() {
+            let reader = BufReader::new(stdout_pipe);
+            for line in reader.lines().flatten() {
+                if let Some(json_str) = line.strip_prefix("PROGRESS:") {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        let stage = val
+                            .get("stage")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("separating")
+                            .to_string();
+                        let percent = val
+                            .get("percent")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            .min(100) as u8;
+                        let message = val
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Extracting stems...")
+                            .to_string();
+                        let _ = app.emit(
+                            "separation-progress",
+                            SeparationProgressEvent {
+                                stage,
+                                percent,
+                                message,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed waiting for AI stem separator: {}", e))?;
+        let stderr_text = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+
+        if !status.success() || !result_json_path.is_file() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            let tail: String = stderr_text
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(if tail.trim().is_empty() {
+                "AI stem separation failed unexpectedly.".to_string()
+            } else {
+                format!("AI stem separation failed:\n{}", tail)
+            });
+        }
+
+        let raw_json = fs::read_to_string(&result_json_path)
+            .map_err(|e| format!("Failed to read separator output metadata: {}", e))?;
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw_json)
+            .map_err(|e| format!("Failed to parse separator output metadata: {}", e))?;
+
+        let vocal_path = parsed
+            .get("vocalPath")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Separator did not return a vocal stem path.".to_string())?
+            .to_string();
+        let instrumental_path = parsed
+            .get("instrumentalPath")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Separator did not return an instrumental stem path.".to_string())?
+            .to_string();
+        let backing_vocal_path = parsed
+            .get("backingVocalPath")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mode_used = parsed
+            .get("modeUsed")
+            .and_then(|v| v.as_str())
+            .unwrap_or(mode_arg)
+            .to_string();
+
+        Ok(SeparateStemsResponse {
+            output_dir: output_dir.to_string_lossy().to_string(),
+            vocal_path,
+            instrumental_path,
+            backing_vocal_path,
+            mode_used,
+        })
+    })
+    .await
+    .map_err(|e| format!("Stem separation task panicked: {}", e))?
+}
+
+fn find_melody_python() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = vec![
+        app_runtime_dir().join("venv/bin/python"),
+        app_runtime_dir().join("venv/bin/python3"),
+        app_runtime_dir().join("separator-venv/bin/python"),
+    ];
+    if let Ok(home) = env::var("HOME") {
+        let home_path = PathBuf::from(&home);
+        candidates.push(home_path.join(".local/pipx/venvs/audio-separator/bin/python"));
+        candidates.push(home_path.join(".local/pipx/venvs/openai-whisper/bin/python"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/python3"));
+    candidates.push(PathBuf::from("/usr/local/bin/python3"));
+
+    for py in candidates {
+        if !py.is_file() {
+            continue;
+        }
+        if let Ok(status) = Command::new(&py)
+            .args(["-c", "import numpy, scipy, soundfile"])
+            .status()
+        {
+            if status.success() {
+                return Some(py);
+            }
+        }
+    }
+    None
+}
+
+const MELODY_GUIDE_SCRIPT: &str = r#"import json, math, os, subprocess, sys
+import numpy as np
+import scipy.ndimage as ndimage
+import scipy.signal as signal
+import soundfile as sf
+
+def decode_mono_pcm(audio_path, sr, ffmpeg_bin):
+    cmd = [
+        ffmpeg_bin, "-v", "error", "-i", audio_path,
+        "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"
+    ]
+    raw = subprocess.check_output(cmd)
+    return np.frombuffer(raw, dtype=np.float32).copy()
+
+def extract_f0_100hz(audio_16k):
+    """
+    Extract 100 Hz (10ms hop) vocal pitch contour strictly as scalar Hz values.
+    Zero human voice samples are ever passed to the output synthesizer.
+    """
+    n_samples = len(audio_16k)
+    hop_16k = 160  # 10ms at 16 kHz -> 100 Hz
+    target_frames = max(1, int(round(n_samples / hop_16k)))
+
+    try:
+        import torch
+        import torchfcpe
+
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        model = torchfcpe.spawn_bundled_infer_model(device=device)
+
+        # Process in 60s chunks with 1s overlap to keep MPS memory bounded on long songs
+        chunk_sec = 60
+        overlap_sec = 1
+        chunk_samples = chunk_sec * 16000
+        overlap_samples = overlap_sec * 16000
+        f0_full = np.zeros(target_frames, dtype=np.float32)
+
+        pos = 0
+        with torch.inference_mode():
+            while pos < n_samples:
+                end_pos = min(n_samples, pos + chunk_samples)
+                left_pad = min(pos, overlap_samples)
+                right_pad = min(n_samples - end_pos, overlap_samples)
+                seg = audio_16k[pos - left_pad : end_pos + right_pad]
+                if len(seg) < 1600:
+                    break
+                t_in = torch.from_numpy(seg).float().unsqueeze(0).unsqueeze(-1).to(device)
+                f0_seg = model.infer(
+                    t_in,
+                    sr=16000,
+                    decoder_mode="local_argmax",
+                    threshold=0.008,
+                    f0_min=75.0,
+                    f0_max=1050.0,
+                    interp_uv=False,
+                )
+                f0_np = f0_seg.squeeze().detach().cpu().numpy().astype(np.float32)
+                if f0_np.ndim == 0:
+                    f0_np = np.array([float(f0_np)], dtype=np.float32)
+
+                trim_l = int(round(left_pad / hop_16k))
+                out_start = int(round(pos / hop_16k))
+                out_end = min(target_frames, int(round(end_pos / hop_16k)))
+                need = out_end - out_start
+                sliced = f0_np[trim_l : trim_l + need]
+                if len(sliced) > 0:
+                    f0_full[out_start : out_start + len(sliced)] = sliced
+                pos = end_pos
+
+        return f0_full, f"torchfcpe ({device})"
+    except Exception:
+        # Automatic zero-extra-dependency fallback using librosa.pyin
+        import librosa
+        f0, voiced_flag, voiced_prob = librosa.pyin(
+            audio_16k,
+            fmin=75.0,
+            fmax=1050.0,
+            sr=16000,
+            frame_length=1024,
+            hop_length=hop_16k,
+            fill_na=0.0,
+        )
+        f0 = np.nan_to_num(f0, nan=0.0).astype(np.float32)
+        if len(f0) < target_frames:
+            f0 = np.pad(f0, (0, target_frames - len(f0)))
+        else:
+            f0 = f0[:target_frames]
+        return f0, "librosa.pyin"
+
+def condition_melody_controls(f0_raw, audio_16k, style):
+    """
+    Transform raw pitch + vocal RMS into clean, purely musical instrument controls:
+    - Gates out low-level bleed / breath clicks
+    - Removes short spurious voiced blips (< 70ms)
+    - Bridges tiny consonant micro-gaps (< 40ms) for smooth legato phrasing
+    - Gently stabilizes melody notes and shapes smooth instrument ADSR envelopes
+    """
+    hop = 160
+    n_frames = len(f0_raw)
+
+    # 1. Compute 100 Hz RMS solely to detect active vocal phrases
+    rms = np.zeros(n_frames, dtype=np.float32)
+    for i in range(n_frames):
+        s = i * hop
+        e = min(len(audio_16k), s + hop)
+        if e > s:
+            seg = audio_16k[s:e]
+            rms[i] = float(np.sqrt(np.mean(seg * seg)))
+
+    smooth_rms = ndimage.gaussian_filter1d(rms, sigma=1.5)
+    p95 = float(np.percentile(smooth_rms, 95)) if n_frames > 0 else 0.0
+    rms_gate = max(0.006, p95 * 0.075)
+
+    voiced = (f0_raw > 65.0) & (smooth_rms >= rms_gate)
+    f0 = np.where(voiced, f0_raw, 0.0).astype(np.float32)
+
+    # 2. Bridge tiny consonant gaps (< 50ms = 5 frames) when pitch is continuous
+    i = 0
+    while i < n_frames:
+        if f0[i] <= 0:
+            j = i
+            while j < n_frames and f0[j] <= 0:
+                j += 1
+            gap_len = j - i
+            if 0 < gap_len <= 4 and i > 0 and j < n_frames and f0[i - 1] > 0 and f0[j] > 0:
+                semi_diff = abs(12.0 * math.log2(f0[j] / f0[i - 1]))
+                if semi_diff <= 2.5:
+                    f0[i:j] = np.linspace(f0[i - 1], f0[j], gap_len + 2)[1:-1]
+            i = j
+        else:
+            i += 1
+
+    # 3. Drop isolated voiced blips shorter than 70ms (7 frames)
+    i = 0
+    while i < n_frames:
+        if f0[i] > 0:
+            j = i
+            while j < n_frames and f0[j] > 0:
+                j += 1
+            if (j - i) < 7:
+                f0[i:j] = 0.0
+            i = j
+        else:
+            i += 1
+
+    voiced_mask = f0 > 0
+    if not np.any(voiced_mask):
+        return (
+            np.zeros(n_frames, dtype=np.float32),
+            np.zeros(n_frames, dtype=np.float32),
+            np.zeros(n_frames, dtype=np.float32),
+            np.zeros(n_frames, dtype=np.float32),
+        )
+
+    # 4. Shift +1 octave higher into the airy upper karaoke guide register (C5-C6)
+    #    unless the original vocalist is already singing ultra-high (> 650 Hz median)
+    med_f0 = float(np.median(f0[voiced_mask]))
+    if med_f0 < 650.0:
+        octave_mul = 2.0
+    elif med_f0 > 1300.0:
+        octave_mul = 0.5
+    else:
+        octave_mul = 1.0
+    f0 = np.where(voiced_mask, f0 * octave_mul, 0.0)
+
+    # 5. Smooth each voiced note segment in MIDI pitch space + subtle melodic pitch centering
+    #    so the guide sounds like a real instrumentalist playing cleanly in tune
+    f0_clean = np.zeros(n_frames, dtype=np.float32)
+    note_onset = np.zeros(n_frames, dtype=np.float32)
+    hold_age = np.zeros(n_frames, dtype=np.float32)
+
+    i = 0
+    while i < n_frames:
+        if f0[i] > 0:
+            j = i
+            while j < n_frames and f0[j] > 0:
+                j += 1
+            seg_f0 = f0[i:j]
+            midi = 69.0 + 12.0 * np.log2(np.maximum(seg_f0, 40.0) / 440.0)
+            if len(midi) >= 5:
+                midi = ndimage.median_filter(midi, size=5, mode="nearest")
+            midi = ndimage.gaussian_filter1d(midi, sigma=1.6, mode="nearest")
+
+            # Gentle magnetic pull toward nearest semitone on steady notes (preserves glides & vibrato)
+            dm = np.abs(np.gradient(midi)) if len(midi) > 1 else np.zeros_like(midi)
+            stability = np.clip(1.0 - dm / 0.35, 0.0, 1.0)
+            nearest = np.round(midi)
+            pull = 0.38 if style == "synth" else 0.25
+            midi = midi + pull * stability * (nearest - midi)
+
+            f0_clean[i:j] = (440.0 * np.power(2.0, (midi - 69.0) / 12.0)).astype(np.float32)
+
+            # Detect phrase start + melodic note transitions (> 0.65 semitone jump) for natural attack chiff/bell
+            note_onset[i] = 1.0
+            last_note_start = i
+            for k in range(i + 1, j):
+                rel = k - i
+                if abs(midi[rel] - midi[rel - 1]) > 0.65 and (k - last_note_start) >= 8:
+                    note_onset[k] = 0.85
+                    last_note_start = k
+                hold_age[k] = (k - last_note_start) * 0.01  # seconds held on current note
+            i = j
+        else:
+            i += 1
+
+    # 6. Build smooth musical instrument amplitude envelope (strips syllabic vocal choppiness)
+    norm_rms = np.clip(smooth_rms / max(p95, 1e-4), 0.0, 1.25)
+    musical_dyn = np.where(f0_clean > 0, 0.45 + 0.55 * np.power(np.clip(norm_rms, 0.0, 1.0), 0.38), 0.0)
+
+    # Smooth instrument ADSR attack/release follower (100 Hz = 10ms/frame)
+    attack_tc = 0.032 if style == "flute" else 0.016
+    release_tc = 0.115 if style == "flute" else 0.145
+    a_att = 1.0 - math.exp(-0.01 / attack_tc)
+    a_rel = 1.0 - math.exp(-0.01 / release_tc)
+
+    env = np.zeros(n_frames, dtype=np.float32)
+    cur = 0.0
+    for k in range(n_frames):
+        tgt = float(musical_dyn[k])
+        alpha = a_att if tgt > cur else a_rel
+        cur = cur + alpha * (tgt - cur)
+        env[k] = cur
+
+    # Extend f0 slightly across release tails so notes fade cleanly on pitch (never dropping to 0 Hz mid-release)
+    last_hz = 440.0
+    for k in range(n_frames):
+        if f0_clean[k] > 0:
+            last_hz = float(f0_clean[k])
+        elif env[k] > 1e-4:
+            f0_clean[k] = last_hz
+
+    return f0_clean, env, note_onset, hold_age
+
+def build_mono_reverb_ir(sr, decay_sec, hp_hz, lp_hz, seed):
+    rng = np.random.default_rng(seed)
+    n = int(sr * decay_sec)
+    t = np.arange(n, dtype=np.float32) / sr
+    decay = np.exp(-6.5 * t / decay_sec).astype(np.float32)
+    # Soft pre-delay fade-in (14ms)
+    pre = int(sr * 0.014)
+    if pre < n:
+        decay[:pre] *= np.linspace(0.0, 1.0, pre, dtype=np.float32)
+
+    b_hp, a_hp = signal.butter(2, hp_hz / (sr * 0.5), btype="highpass")
+    b_lp, a_lp = signal.butter(2, lp_hz / (sr * 0.5), btype="lowpass")
+
+    ir = rng.standard_normal(n).astype(np.float32) * decay
+    ir = signal.lfilter(b_lp, a_lp, signal.lfilter(b_hp, a_hp, ir))
+    norm = max(1e-5, float(np.sqrt(np.sum(ir * ir))))
+    return (ir / norm).astype(np.float32)
+
+def synthesize_ddsp_instrument(f0_100, env_100, onset_100, hold_100, dur_sec, style, sr=44100):
+    """
+    Pure MONO (dead-center) DDSP Harmonic Synthesizer.
+    Synthesizes 100% pure concert flute or modern KTV soft synth mono audio from scratch
+    with zero human voice bleed and zero broadband hiss.
+    """
+    n_samples = max(1, int(round(dur_sec * sr)))
+    n_frames = len(f0_100)
+    if n_frames <= 1 or float(np.max(env_100)) < 1e-4:
+        return np.zeros(n_samples, dtype=np.float32)
+
+    x_frames = np.linspace(0.0, n_samples - 1, n_frames, dtype=np.float64)
+    x_samples = np.arange(n_samples, dtype=np.float64)
+
+    f0_s = np.interp(x_samples, x_frames, f0_100.astype(np.float64))
+    env_s = np.interp(x_samples, x_frames, env_100.astype(np.float64)).astype(np.float32)
+    hold_s = np.interp(x_samples, x_frames, hold_100.astype(np.float64)).astype(np.float32)
+
+    # Build smooth exponential onset impulse envelope at sample rate
+    onset_decay_sec = 0.032 if style == "flute" else 0.140
+    onset_s = np.zeros(n_samples, dtype=np.float32)
+    onset_indices = np.where(onset_100 > 0.1)[0]
+    decay_len = int(sr * onset_decay_sec * 4.0)
+    decay_curve = np.exp(-np.arange(decay_len, dtype=np.float32) / (sr * onset_decay_sec))
+    for idx in onset_indices:
+        s0 = int(round(x_frames[idx]))
+        s1 = min(n_samples, s0 + decay_len)
+        seg_len = s1 - s0
+        if seg_len > 0:
+            onset_s[s0:s1] = np.maximum(onset_s[s0:s1], float(onset_100[idx]) * decay_curve[:seg_len])
+
+    t_sec = x_samples / sr
+    nyquist = sr * 0.48
+
+    if style == "flute":
+        # Silky, hiss-free concert flute: pure loudness-conditioned harmonic bank + gentle vibrato
+        vib_depth = np.clip((hold_s - 0.22) / 0.35, 0.0, 1.0) * 0.006  # ~ +/- 10 cents
+        f0_mod = f0_s * (1.0 + vib_depth * np.sin(2.0 * math.pi * 5.2 * t_sec))
+        phase = np.cumsum(2.0 * math.pi * f0_mod / sr)
+
+        dyn = np.clip(env_s, 0.0, 1.0)
+        harm_base = [1.00, 0.34, 0.11, 0.036, 0.012, 0.005]
+        harm_dyn  = [0.00, 0.12, 0.05, 0.018, 0.006, 0.002]
+
+        harmonic_sig = np.zeros(n_samples, dtype=np.float32)
+        for k in range(1, len(harm_base) + 1):
+            anti_alias = (f0_mod * k < nyquist).astype(np.float32)
+            amp = (harm_base[k - 1] + harm_dyn[k - 1] * dyn) * anti_alias
+            harmonic_sig += (amp * np.sin(k * phase)).astype(np.float32)
+
+        # Ultra-subtle onset tonguing harmonic accent (zero broadband hiss/noise!)
+        tongue_accent = (0.06 * onset_s * np.sin(2.0 * phase)).astype(np.float32)
+        dry = (harmonic_sig + tongue_accent) * env_s
+
+        # Smooth warmth low-pass at 5.2 kHz for pure woody flute tone
+        b_w, a_w = signal.butter(2, 5200.0 / (sr * 0.5), btype="lowpass")
+        dry = signal.lfilter(b_w, a_w, dry).astype(np.float32)
+
+        ir = build_mono_reverb_ir(sr, decay_sec=0.62, hp_hz=300.0, lp_hz=4200.0, seed=101)
+        wet = signal.fftconvolve(dry, ir, mode="full")[:n_samples]
+        return (0.86 * dry + 0.16 * wet).astype(np.float32)
+
+    else:
+        # Modern DAM / JOYSOUND Karaoke Guide Synth (pure centered mono):
+        # Silky sine-triangle electric celesta/pad with delicate bell onset shimmer
+        phase = np.cumsum(2.0 * math.pi * f0_s / sr)
+
+        body_weights = [1.00, 0.15, 0.070, 0.022, 0.008]
+        bell_weights = [0.00, 0.13, 0.16,  0.08,  0.025]
+
+        dry = np.zeros(n_samples, dtype=np.float32)
+        for k in range(1, len(body_weights) + 1):
+            anti_alias = (f0_s * k < nyquist).astype(np.float32)
+            amp = (body_weights[k - 1] + bell_weights[k - 1] * onset_s) * anti_alias
+            dry += (amp * np.sin(k * phase)).astype(np.float32)
+
+        dry *= env_s
+
+        # Soft silky low-pass at 5.2 kHz (zero harshness)
+        b_s, a_s = signal.butter(2, 5200.0 / (sr * 0.5), btype="lowpass")
+        dry = signal.lfilter(b_s, a_s, dry).astype(np.float32)
+
+        ir = build_mono_reverb_ir(sr, decay_sec=0.72, hp_hz=280.0, lp_hz=4800.0, seed=202)
+        wet = signal.fftconvolve(dry, ir, mode="full")[:n_samples]
+        return (0.84 * dry + 0.18 * wet).astype(np.float32)
+
+def measure_active_rms_db(mono):
+    if len(mono) < 100:
+        return -12.0
+    frame = 1600  # 100ms at 16 kHz
+    n = len(mono) // frame
+    if n < 1:
+        rms = float(np.sqrt(np.mean(mono * mono)))
+        return 20.0 * math.log10(max(rms, 1e-6))
+    sq = mono[: n * frame].reshape(n, frame)
+    rms_vals = np.sqrt(np.mean(sq * sq, axis=1))
+    active = rms_vals[rms_vals > 1e-4]
+    if len(active) == 0:
+        return -12.0
+    ref = float(np.percentile(active, 75))
+    return 20.0 * math.log10(max(ref, 1e-6))
+
+def calibrate_guide_loudness(mono, inst_path, ffmpeg_bin):
+    """
+    Calibrate mono guide melody to sit ~21 dB below the instrumental's active RMS
+    (so 0 dB is a polite subtle cue, and the default -3 dB sits ~24 dB below — barely audible).
+    """
+    frame = 4410  # 100ms at 44.1 kHz
+    n = len(mono) // frame
+    if n < 1:
+        return mono
+    rms_vals = np.sqrt(np.mean(mono[: n * frame].reshape(n, frame) ** 2, axis=1))
+    active = rms_vals[rms_vals > 1e-4]
+    if len(active) == 0:
+        return mono
+    cur_rms_db = 20.0 * math.log10(max(float(np.percentile(active, 75)), 1e-6))
+
+    inst_rms_db = -11.0
+    if inst_path and os.path.isfile(inst_path):
+        try:
+            inst_16k = decode_mono_pcm(inst_path, 16000, ffmpeg_bin)
+            inst_rms_db = measure_active_rms_db(inst_16k)
+        except Exception:
+            inst_rms_db = -11.0
+
+    target_rms_db = max(-35.0, min(-26.0, inst_rms_db - 21.0))
+    gain_db = target_rms_db - cur_rms_db
+    gain_lin = math.pow(10.0, gain_db / 20.0)
+    out = mono * gain_lin
+
+    # Hard peak safety ceiling at -20 dBFS so high octave notes never cut through harshly
+    peak = float(np.max(np.abs(out)))
+    max_peak = math.pow(10.0, -20.0 / 20.0)
+    if peak > max_peak:
+        out = out * (max_peak / peak)
+    return np.clip(out, -0.95, 0.95).astype(np.float32)
+
+def main():
+    vocal_path = sys.argv[1]
+    inst_path = sys.argv[2]
+    style = sys.argv[3].strip().lower()
+    out_flac = sys.argv[4]
+    ffmpeg_bin = sys.argv[5]
+    result_json = sys.argv[6]
+
+    if style not in ("flute", "synth"):
+        style = "flute"
+
+    audio_16k = decode_mono_pcm(vocal_path, 16000, ffmpeg_bin)
+    dur_sec = len(audio_16k) / 16000.0
+
+    f0_raw, engine_used = extract_f0_100hz(audio_16k)
+    f0_clean, env, onset, hold_age = condition_melody_controls(f0_raw, audio_16k, style)
+    mono = synthesize_ddsp_instrument(f0_clean, env, onset, hold_age, dur_sec, style, sr=44100)
+    mono = calibrate_guide_loudness(mono, inst_path, ffmpeg_bin)
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_flac)), exist_ok=True)
+    # Export 1-channel pure MONO (center) FLAC
+    sf.write(out_flac, mono, 44100, format="FLAC", subtype="PCM_16")
+
+    with open(result_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "filePath": out_flac,
+                "fileName": os.path.basename(out_flac),
+                "style": style,
+                "engineUsed": engine_used,
+            },
+            f,
+        )
+
+if __name__ == "__main__":
+    main()
+"#;
+
+#[tauri::command]
+async fn generate_melody_guide(
+    request: GenerateMelodyGuideRequest,
+) -> Result<GenerateMelodyGuideResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(py_path) = find_melody_python() else {
+            return Err(
+                "Python AI runtime not found. Please run First-Run Studio Setup to enable Melody Guide synthesis."
+                    .to_string(),
+            );
+        };
+        let Some((_, ffmpeg_path)) = search_binary(&["ffmpeg"]) else {
+            return Err("FFmpeg was not found on your Mac. Install it via First-Run Setup.".to_string());
+        };
+
+        let style = if request.style.trim().eq_ignore_ascii_case("synth") {
+            "synth"
+        } else {
+            "flute"
+        };
+
+        let stamp = unique_stamp();
+        let temp_dir = env::temp_dir().join(format!("karaocraft_melody_{}", stamp));
+        fs::create_dir_all(&temp_dir)
+            .map_err(|e| format!("Failed to create temp melody directory: {}", e))?;
+
+        let ext = request
+            .vocal_ext
+            .trim_start_matches('.')
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>();
+        let safe_ext = if ext.is_empty() { "flac".to_string() } else { ext };
+
+        let mut preferred_out_dir: Option<PathBuf> = None;
+        let mut derived_stem: Option<String> = None;
+
+        let vocal_input_path = if let Some(ref direct) = request.vocal_path {
+            let p = PathBuf::from(direct.trim());
+            if p.is_file() {
+                preferred_out_dir = p.parent().map(|d| d.to_path_buf());
+                derived_stem = p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
+                p
+            } else {
+                let fallback = temp_dir.join(format!("vocal.{}", safe_ext));
+                let bytes = decode_base64(&request.vocal_base64)?;
+                fs::write(&fallback, bytes)
+                    .map_err(|e| format!("Failed to write temp vocal for melody guide: {}", e))?;
+                fallback
+            }
+        } else {
+            let fallback = temp_dir.join(format!("vocal.{}", safe_ext));
+            let bytes = decode_base64(&request.vocal_base64)?;
+            fs::write(&fallback, bytes)
+                .map_err(|e| format!("Failed to write temp vocal for melody guide: {}", e))?;
+            fallback
+        };
+
+        // Prefer saving right next to the instrumental (e.g. inside "<Song> Stems/") if available
+        if let Some(ref inst_p) = request.instrumental_path {
+            let p = PathBuf::from(inst_p.trim());
+            if let Some(parent) = p.parent() {
+                if parent.is_dir() {
+                    preferred_out_dir = Some(parent.to_path_buf());
+                }
+            }
+        }
+
+        let clean_stem = derived_stem
+            .map(|s| {
+                let lower = s.to_lowercase();
+                for suffix in ["_vocals", "-vocals", " (vocals)", " [vocals]", " vocals"] {
+                    if lower.ends_with(suffix) && s.len() > suffix.len() {
+                        let cut = s.len() - suffix.len();
+                        if s.is_char_boundary(cut) {
+                            return s[..cut].to_string();
+                        }
+                    }
+                }
+                s
+            })
+            .or_else(|| request.song_title.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| format!("KaraoCraft_Song_{}", stamp));
+        let base_name = sanitize_filename(&clean_stem);
+
+        let out_dir = preferred_out_dir.unwrap_or_else(|| app_runtime_dir().join("melody"));
+        fs::create_dir_all(&out_dir)
+            .map_err(|e| format!("Failed to create melody output directory: {}", e))?;
+
+        let out_flac = out_dir.join(format!("{}_melody_{}.flac", base_name, style));
+        let script_path = temp_dir.join("generate_melody.py");
+        let result_json_path = temp_dir.join("result.json");
+        fs::write(&script_path, MELODY_GUIDE_SCRIPT)
+            .map_err(|e| format!("Failed to write melody guide script: {}", e))?;
+
+        let inst_arg = request
+            .instrumental_path
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let bin_dir = app_runtime_dir().join("bin");
+        let existing_path = env::var("PATH").unwrap_or_default();
+        let enriched_path = format!(
+            "{}:/opt/homebrew/bin:/usr/local/bin:{}",
+            bin_dir.display(),
+            existing_path
+        );
+
+        let out = Command::new(&py_path)
+            .env("PATH", &enriched_path)
+            .arg(&script_path)
+            .arg(&vocal_input_path)
+            .arg(&inst_arg)
+            .arg(style)
+            .arg(&out_flac)
+            .arg(&ffmpeg_path)
+            .arg(&result_json_path)
+            .output()
+            .map_err(|e| format!("Failed to launch melody guide generator: {}", e))?;
+
+        if !out.status.success() || !result_json_path.is_file() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let _ = fs::remove_dir_all(&temp_dir);
+            let tail: String = stderr
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(if tail.trim().is_empty() {
+                "Melody guide generation failed unexpectedly.".to_string()
+            } else {
+                format!("Melody guide generation failed:\n{}", tail)
+            });
+        }
+
+        let raw_json = fs::read_to_string(&result_json_path)
+            .map_err(|e| format!("Failed to read melody guide output metadata: {}", e))?;
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw_json)
+            .map_err(|e| format!("Failed to parse melody guide output metadata: {}", e))?;
+
+        let file_path = parsed
+            .get("filePath")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Melody guide generator did not return a file path.".to_string())?
+            .to_string();
+        let file_name = parsed
+            .get("fileName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("melody_guide.flac")
+            .to_string();
+        let engine_used = parsed
+            .get("engineUsed")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ddsp")
+            .to_string();
+
+        Ok(GenerateMelodyGuideResponse {
+            file_path,
+            file_name,
+            style: style.to_string(),
+            engine_used,
+        })
+    })
+    .await
+    .map_err(|e| format!("Melody guide task panicked: {}", e))?
 }
 
 #[tauri::command]
@@ -696,10 +1837,44 @@ async fn render_karaoke_mp4(request: RenderMp4Request) -> Result<RenderMp4Respon
             }
         }
 
+        let mut melody_guide_path: Option<PathBuf> = None;
+        if let Some(ref mg_direct) = request.melody_guide_path {
+            let p = PathBuf::from(mg_direct.trim());
+            if p.is_file() {
+                melody_guide_path = Some(p);
+            }
+        }
+        if melody_guide_path.is_none() {
+            if let Some(ref mg_b64) = request.melody_guide_base64 {
+                if !mg_b64.trim().is_empty() {
+                    let mg_bytes = decode_base64(mg_b64)?;
+                    let raw_mg_ext = request
+                        .melody_guide_ext
+                        .as_deref()
+                        .unwrap_or("flac")
+                        .trim_start_matches('.')
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect::<String>();
+                    let safe_mg_ext = if raw_mg_ext.is_empty() {
+                        "flac".to_string()
+                    } else {
+                        raw_mg_ext
+                    };
+                    let mg_file = work_dir.join(format!("melody_guide.{}", safe_mg_ext));
+                    fs::write(&mg_file, mg_bytes)
+                        .map_err(|e| format!("Failed to write melody guide stream: {}", e))?;
+                    melody_guide_path = Some(mg_file);
+                }
+            }
+        }
+
         let audio_gain_db = request.audio_gain_db.unwrap_or(0.0).clamp(-12.0, 6.0);
         let backing_gain_db = request.backing_vocal_gain_db.unwrap_or(0.0).clamp(-12.0, 6.0);
+        let melody_gain_db = request.melody_guide_gain_db.unwrap_or(-3.0).clamp(-9.0, 3.0);
         let enable_limiter = audio_gain_db >= 3.0
-            || (backing_vocal_path.is_some() && backing_gain_db >= 3.0);
+            || (backing_vocal_path.is_some() && backing_gain_db >= 3.0)
+            || (melody_guide_path.is_some() && melody_gain_db >= 3.0);
 
         let home_dir = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let downloads_dir = PathBuf::from(&home_dir).join("Downloads");
@@ -791,17 +1966,40 @@ async fn render_karaoke_mp4(request: RenderMp4Request) -> Result<RenderMp4Respon
             }
             cmd.arg("-i").arg(&audio_path);
 
+            let mut extra_tracks: Vec<(&PathBuf, f64)> = Vec::new();
             if let Some(ref bv_path) = backing_vocal_path {
-                cmd.arg("-i").arg(bv_path);
+                extra_tracks.push((bv_path, backing_gain_db));
+            }
+            if let Some(ref mg_path) = melody_guide_path {
+                extra_tracks.push((mg_path, melody_gain_db));
+            }
+
+            if !extra_tracks.is_empty() {
+                for (track_path, _) in &extra_tracks {
+                    cmd.arg("-i").arg(track_path);
+                }
                 let limiter_suffix = if enable_limiter {
                     ",alimiter=limit=0.95:attack=5:release=50"
                 } else {
                     ""
                 };
-                let fc = format!(
-                    "[0:v]{}[vout];[1:a]volume={:.2}dB[a1];[2:a]volume={:.2}dB[a2];[a1][a2]amix=inputs=2:duration=longest:normalize=0{}[aout]",
-                    vf_arg, audio_gain_db, backing_gain_db, limiter_suffix
-                );
+                let mut fc_parts: Vec<String> = vec![
+                    format!("[0:v]{}[vout]", vf_arg),
+                    format!("[1:a]volume={:.2}dB[a1]", audio_gain_db),
+                ];
+                let mut mix_labels = String::from("[a1]");
+                for (idx, (_, gain_db)) in extra_tracks.iter().enumerate() {
+                    let input_num = idx + 2;
+                    let label = format!("a{}", input_num);
+                    fc_parts.push(format!("[{}:a]volume={:.2}dB[{}]", input_num, gain_db, label));
+                    mix_labels.push_str(&format!("[{}]", label));
+                }
+                let total_inputs = 1 + extra_tracks.len();
+                fc_parts.push(format!(
+                    "{}amix=inputs={}:duration=longest:normalize=0{}[aout]",
+                    mix_labels, total_inputs, limiter_suffix
+                ));
+                let fc = fc_parts.join(";");
                 cmd.args(["-filter_complex", &fc, "-map", "[vout]", "-map", "[aout]"]);
             } else {
                 cmd.args(["-vf", vf_arg]);
@@ -1595,13 +2793,16 @@ async fn install_runtime_dependencies(app: tauri::AppHandle) -> Result<SystemCap
             }
         }
 
-        // Step 2: Ensure uv + Python 3.10 venv + torchaudio, uroman, pykakasi
-        emit_progress("python", 35, "Checking AI lyrics alignment runtime...");
-        if find_mms_python().is_none() {
+        // Step 2: Ensure uv + Python 3.12 venv + torchaudio, uroman, pykakasi & audio-separator
+        // (Python 3.12 ensures SciPy >= 1.16 wheels compatible with macOS 27+ strict dyld validation)
+        emit_progress("python", 30, "Checking AI alignment & stem separation runtimes...");
+        let need_mms = find_mms_python().is_none();
+        let need_sep = find_separator_python().is_none();
+        if need_mms || need_sep {
             let uv_bin = if let Some((_, existing_uv)) = search_binary(&["uv"]) {
                 existing_uv
             } else {
-                emit_progress("python", 42, "Installing lightweight Python package manager (uv)...");
+                emit_progress("python", 38, "Installing lightweight Python package manager (uv)...");
                 let install_cmd = format!(
                     "curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR='{}' sh",
                     bin_dir.display()
@@ -1614,41 +2815,167 @@ async fn install_runtime_dependencies(app: tauri::AppHandle) -> Result<SystemCap
                 return Err("Could not install uv package manager. Please check your internet connection.".to_string());
             }
 
-            emit_progress("python", 55, "Creating isolated Python 3.10 environment...");
-            let venv_status = Command::new(&uv_bin)
-                .env("PATH", &enriched_path)
-                .args(["venv", "--python", "3.10"])
-                .arg(&venv_dir)
-                .status()
-                .map_err(|e| format!("Failed to create Python venv: {}", e))?;
+            let venv_py = venv_dir.join("bin/python");
+            let venv_needs_recreate = if !venv_py.is_file() {
+                true
+            } else {
+                // Recreate legacy Python < 3.11 venvs so SciPy >= 1.16 can install cleanly on macOS 27+
+                !Command::new(&venv_py)
+                    .args(["-c", "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            };
 
-            if !venv_status.success() {
-                return Err("Failed to initialize Python 3.10 virtual environment.".to_string());
+            if venv_needs_recreate {
+                emit_progress("python", 46, "Creating isolated Python 3.12 environment...");
+                let venv_status = Command::new(&uv_bin)
+                    .env("PATH", &enriched_path)
+                    .args(["venv", "--clear", "--python", "3.12"])
+                    .arg(&venv_dir)
+                    .status()
+                    .map_err(|e| format!("Failed to create Python venv: {}", e))?;
+
+                if !venv_status.success() {
+                    return Err("Failed to initialize Python 3.12 virtual environment.".to_string());
+                }
             }
 
-            emit_progress(
-                "packages",
-                68,
-                "Installing PyTorch Audio & universal phonetic libraries (torchaudio, uroman, pykakasi)...",
-            );
-            let venv_py = venv_dir.join("bin/python");
-            let pip_status = Command::new(&uv_bin)
-                .env("PATH", &enriched_path)
-                .args([
-                    "pip",
-                    "install",
-                    "--python",
-                    &venv_py.to_string_lossy(),
-                    "torchaudio",
-                    "uroman",
-                    "pykakasi",
-                    "numpy",
-                ])
-                .status()
-                .map_err(|e| format!("Failed to install AI packages: {}", e))?;
+            if need_mms && need_sep {
+                emit_progress(
+                    "packages",
+                    58,
+                    "Installing PyTorch Audio, phonetic aligner & BS-Roformer stem separator...",
+                );
+                let unified = Command::new(&uv_bin)
+                    .env("PATH", &enriched_path)
+                    .args([
+                        "pip",
+                        "install",
+                        "--python",
+                        &venv_py.to_string_lossy(),
+                        "audio-separator[cpu]",
+                        "scipy>=1.16",
+                        "audioread",
+                        "torchfcpe",
+                        "torchaudio",
+                        "uroman",
+                        "pykakasi",
+                        "numpy",
+                    ])
+                    .status();
 
-            if !pip_status.success() {
-                return Err("Failed to install torchaudio and phonetic alignment packages.".to_string());
+                if !unified.map(|s| s.success()).unwrap_or(false) {
+                    // Fallback: install MMS_FA in main venv and audio-separator in dedicated separator-venv
+                    let mms_ok = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args([
+                            "pip",
+                            "install",
+                            "--python",
+                            &venv_py.to_string_lossy(),
+                            "torchaudio",
+                            "uroman",
+                            "pykakasi",
+                            "numpy",
+                        ])
+                        .status()
+                        .map_err(|e| format!("Failed to install alignment packages: {}", e))?;
+                    if !mms_ok.success() {
+                        return Err("Failed to install torchaudio and phonetic alignment packages.".to_string());
+                    }
+
+                    let sep_venv_dir = runtime_dir.join("separator-venv");
+                    let sep_py = sep_venv_dir.join("bin/python");
+                    let _ = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args(["venv", "--clear", "--python", "3.12"])
+                        .arg(&sep_venv_dir)
+                        .status();
+                    let sep_ok = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args([
+                            "pip",
+                            "install",
+                            "--python",
+                            &sep_py.to_string_lossy(),
+                            "audio-separator[cpu]",
+                            "scipy>=1.16",
+                            "audioread",
+                        ])
+                        .status()
+                        .map_err(|e| format!("Failed to install AI stem separator: {}", e))?;
+                    if !sep_ok.success() {
+                        return Err("Failed to install audio-separator package.".to_string());
+                    }
+                }
+            } else if need_mms {
+                emit_progress(
+                    "packages",
+                    60,
+                    "Installing PyTorch Audio & universal phonetic libraries (torchaudio, uroman, pykakasi)...",
+                );
+                let pip_status = Command::new(&uv_bin)
+                    .env("PATH", &enriched_path)
+                    .args([
+                        "pip",
+                        "install",
+                        "--python",
+                        &venv_py.to_string_lossy(),
+                        "torchaudio",
+                        "uroman",
+                        "pykakasi",
+                        "numpy",
+                    ])
+                    .status()
+                    .map_err(|e| format!("Failed to install AI packages: {}", e))?;
+
+                if !pip_status.success() {
+                    return Err("Failed to install torchaudio and phonetic alignment packages.".to_string());
+                }
+            } else if need_sep {
+                emit_progress(
+                    "packages",
+                    65,
+                    "Installing AI Stem Separator (audio-separator for BS-Roformer)...",
+                );
+                let sep_ok = Command::new(&uv_bin)
+                    .env("PATH", &enriched_path)
+                    .args([
+                        "pip",
+                        "install",
+                        "--python",
+                        &venv_py.to_string_lossy(),
+                        "audio-separator[cpu]",
+                        "scipy>=1.16",
+                        "audioread",
+                    ])
+                    .status();
+                if !sep_ok.map(|s| s.success()).unwrap_or(false) {
+                    let sep_venv_dir = runtime_dir.join("separator-venv");
+                    let sep_py = sep_venv_dir.join("bin/python");
+                    let _ = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args(["venv", "--clear", "--python", "3.12"])
+                        .arg(&sep_venv_dir)
+                        .status();
+                    let fallback_ok = Command::new(&uv_bin)
+                        .env("PATH", &enriched_path)
+                        .args([
+                            "pip",
+                            "install",
+                            "--python",
+                            &sep_py.to_string_lossy(),
+                            "audio-separator[cpu]",
+                            "scipy>=1.16",
+                            "audioread",
+                        ])
+                        .status()
+                        .map_err(|e| format!("Failed to install AI stem separator: {}", e))?;
+                    if !fallback_ok.success() {
+                        return Err("Failed to install audio-separator package.".to_string());
+                    }
+                }
             }
         }
 
@@ -1682,6 +3009,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_system_capabilities,
             transcribe_whisper_words,
+            separate_audio_stems,
+            generate_melody_guide,
             render_karaoke_mp4,
             reveal_in_finder,
             resolve_local_audio_path,

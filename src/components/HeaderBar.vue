@@ -6,7 +6,6 @@ import {
   FilePlus2,
   FolderOpen,
   Save,
-  HelpCircle,
   ArrowLeft,
   ChevronDown,
   Check,
@@ -136,14 +135,6 @@ onBeforeUnmount(() => {
       <div class="absolute right-0 top-1/2 -translate-y-1/2 flex items-center gap-2.5 titlebar-no-drag">
         <button
           type="button"
-          @click="project.showUvrGuideModal = true"
-          class="inline-flex items-center gap-1.5 bg-white hover:bg-purple-50 text-brand-purple border border-purple-200 rounded-xl px-3.5 py-2 text-sm font-semibold shadow-sm transition-colors"
-        >
-          <HelpCircle class="w-4 h-4" />
-          <span>UVR Vocal Guide</span>
-        </button>
-        <button
-          type="button"
           @click="project.newProject()"
           title="New Project (Clear Everything)"
           aria-label="New Project"
@@ -198,14 +189,6 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="flex items-center gap-2.5 bg-white/95 px-2 py-0.5 rounded-xl titlebar-no-drag">
-        <button
-          type="button"
-          @click="project.showUvrGuideModal = true"
-          class="inline-flex items-center gap-1.5 text-slate-600 hover:text-brand-purple hover:bg-purple-50 px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors"
-        >
-          <HelpCircle class="w-4 h-4" />
-          <span>UVR Guide</span>
-        </button>
         <button
           type="button"
           @click="project.newProject()"

@@ -97,7 +97,7 @@ async function startAutoInstall() {
 
       <div class="mt-4 space-y-4 text-sm text-slate-600 leading-relaxed">
         <p>
-          To automatically synchronize lyrics to vocals and export 1080p MP4 karaoke videos, KaraoCraft can automatically download and configure its required libraries in the background (one-time setup):
+          To automatically extract vocals &amp; instrumentals, synchronize lyrics, and export 1080p MP4 karaoke videos, KaraoCraft can download and configure its local AI engines in the background (one-time setup):
         </p>
 
         <!-- Status Checklist -->
@@ -122,7 +122,7 @@ async function startAutoInstall() {
           <div class="bg-slate-50 border border-slate-200 rounded-xl p-3.5 flex items-center justify-between gap-3">
             <div>
               <div class="font-bold text-slate-900">2. AI Phonetic Aligner (MMS_FA)</div>
-              <div class="text-xs text-slate-500">Python 3.10 runtime, PyTorch Audio, uroman &amp; pykakasi</div>
+              <div class="text-xs text-slate-500">Python 3.12 runtime, PyTorch Audio, uroman &amp; pykakasi</div>
             </div>
             <span
               class="text-xs font-bold px-2.5 py-1 rounded-full shrink-0"
@@ -133,6 +133,23 @@ async function startAutoInstall() {
               "
             >
               {{ project.systemCaps.whisperAvailable ? 'Ready' : 'Will Install' }}
+            </span>
+          </div>
+
+          <div class="bg-slate-50 border border-slate-200 rounded-xl p-3.5 flex items-center justify-between gap-3">
+            <div>
+              <div class="font-bold text-slate-900">3. AI Stem Separator (BS-Roformer)</div>
+              <div class="text-xs text-slate-500">Built-in vocal, instrumental &amp; backing vocal extraction on Apple GPU</div>
+            </div>
+            <span
+              class="text-xs font-bold px-2.5 py-1 rounded-full shrink-0"
+              :class="
+                project.systemCaps.separatorAvailable
+                  ? 'bg-emerald-100 text-emerald-800'
+                  : 'bg-amber-100 text-amber-800'
+              "
+            >
+              {{ project.systemCaps.separatorAvailable ? 'Ready' : 'Will Install' }}
             </span>
           </div>
         </div>
